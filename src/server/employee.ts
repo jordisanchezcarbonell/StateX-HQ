@@ -20,6 +20,7 @@ import { runGeminiTurn, type GeminiEvent } from "./gemini.js";
 import { costOf } from "./prices.js";
 import { statusDigest } from "./digest.js";
 import { runFreeAgent, freeOnly, type FreeMessage } from "./free-agent.js";
+import { isIntelTool } from "./free-agent-intel.js";
 import { FreeAgentError } from "./free-agent-tools.js";
 import { engineOf, providerEnabled, geminiKey, openrouterCatalog, openrouterCostOf, openrouterEnv, openrouterSlug, markAuthFailed, AUTH_ERROR, type Engine } from "./providers.js";
 import { isTransient, retryDelay, RETRY_DELAYS_MS } from "./retry.js";
@@ -1220,13 +1221,14 @@ export class Employee extends EventEmitter {
             cwd: this.cfg.cwd, model: this.cfg.model!, prompt: batch.map(plainText).join("\n\n"),
             system: this.cfg.systemPrompt, history: histories[session] ?? [], signal: controller.signal, onHistory: saveHistory,
             readOnly: !!this.meetingTurn || this.cfg.permissionMode === "plan",
+            intel: (this.cfg.allowedTools ?? []).filter(isIntelTool),
             approve: async (tool, input, signal) => {
               if (signal.aborted) return false;
               const decision = await this.canUseTool(tool, input, { signal, requestId: crypto.randomUUID(), description: JSON.stringify(input, null, 2), suppressAlwaysAllowRule: true });
               return decision.behavior === "allow";
             },
             onText: text => { if (this.generation === gen) { this.emit("chunk", text); this.emit("chunk_end"); this.push({ role: "assistant", text, ts: Date.now() }); } },
-            onTool: (name, file) => { if (this.generation === gen) this.push({ role: "activity", text: `${name}: ${file}`, kind: name === "Read" ? "read" : "write", ts: Date.now() }); },
+            onTool: (name, file) => { if (this.generation === gen) this.push({ role: "activity", text: `${name}: ${file}`, kind: isIntelTool(name) ? "web" : name === "Read" ? "read" : "write", ts: Date.now() }); },
             onUsage: u => {
               if (this.generation !== gen) return;
               this.model = u.model; this.context = u.input;
