@@ -1,0 +1,136 @@
+// Offline browser smoke test: existing frontend, in-memory API, fresh Chrome profile.
+// Requires an installed Chrome (CHROME_BIN may override its path). No provider/runtime imports.
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {spawn} from 'node:child_process';
+import express from 'express';
+import {WebSocketServer} from 'ws';
+import {createServer} from 'node:http';
+import {defaultLook} from '../dist/server/agents.js';
+
+const chrome=process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+assert(fs.existsSync(chrome),'Install Chrome or set CHROME_BIN; this test never downloads dependencies');
+const scratch=fs.mkdtempSync(path.join(os.tmpdir(),'statex-ui-'));
+const locale=JSON.parse(fs.readFileSync('locales/en.json','utf8'));
+const model={id:'openrouter:cohere/north-mini-code:free',name:'North Mini Code (free)',desc:'UI fixture; not a real provider connection',provider:'openrouter'};
+const mia={id:'mia',office:'main',name:'Mia',role:'Software Developer',color:'#56dfcd',look:defaultLook('mia','#56dfcd'),engine:'openrouter',status:'idle',model:model.id,cost:0,context:0,queued:0,manager:false};
+const office={id:'main',name:'StateX HQ',cwd:'/temporary-ui-fixture',theme:'default'};
+const board={tasks:[],notes:[],ideas:[],mode:'manual',budget:10,roundsPerDay:3,cycle:{phase:'idle',no:0,spent:0,tasks:[]}};
+const providers=['claude','codex','gemini','openrouter'].map(id=>({id,enabled:true,connected:id==='openrouter',installed:true,version:'',detail:id==='openrouter'?'apiKey':'signedOut',models:id==='openrouter'?[model]:[],custom:id==='openrouter'?['cohere/north-mini-code:free']:[],canInstall:false,canLogin:false}));
+const app=express();
+app.get('/i18n.js',(_req,res)=>res.type('js').send('window.PO='+JSON.stringify({locale:'en',locales:[{code:'en',name:'English'}],strings:{ui:locale.ui,rooms:locale.rooms,status:locale.status},models:['claude-sonnet-5-5'],extraModels:[model],efforts:['low','medium','high'],permissions:['default','plan'],themes:['default'],project:office.cwd,projectDisplay:office.cwd,mode:'project',root:office.cwd,firstRun:false,memoryFile:'memory.md',multiOffice:true,defaultOffice:'main',offices:[office]})+';'));
+app.get('/api/providers',(_req,res)=>res.json({providers,extraModels:[model]}));
+app.get('/api/prices',(_req,res)=>res.json({file:'UI fixture',custom:{codex:[],gemini:[]},defaults:{codex:[],gemini:[]}}));
+app.get('/api/settings',(_req,res)=>res.json({sickness:false,syncClaudeAgents:false,refreshHours:24,compactAtTokens:190000,taskSessions:true,envLocked:{},port:0,host:'127.0.0.1'}));
+app.get('/api/offices/main/employees/mia/detail',(_req,res)=>res.json({...mia,configuredModel:model.id,officeName:'StateX HQ',cwd:office.cwd,workdir:office.cwd,officeCwd:office.cwd,permissionMode:'default',allowedTools:[],prompt:'UI fixture only',memory:'',skills:[],projectSkills:[],integrations:[],connectorsOff:[],recent:[],stats:{messages:0,tasks:0},hired:'2026-10-29'}));
+app.get('/api/offices/main/connectors',(_req,res)=>res.json([]));
+app.get('/api/integrations',(_req,res)=>res.json({integrations:[]}));
+app.get('/api/offices/main/board',(_req,res)=>res.json(board));
+app.get('/api/offices/main/costs',(_req,res)=>res.json({today:0,todayTokens:{},cap:{daily:0,codexTokens:0},employees:[],days:[]}));
+app.get('/api/offices/main/activity',(_req,res)=>res.json({events:[],lastSeen:0}));
+app.use('/api',(_req,res)=>res.status(501).json({error:'UI fixture does not execute actions'}));
+app.use(express.static('web'));
+const server=createServer(app);
+const wss=new WebSocketServer({server});
+const submissions=[];
+wss.on('connection',ws=>{
+  ws.send(JSON.stringify({type:'init',offices:[{...office,employees:[mia],board}],quota:null}));
+  ws.on('message',raw=>{
+    const msg=JSON.parse(raw);
+    if(msg.type==='open')ws.send(JSON.stringify({type:'history',office:'main',id:'mia',messages:[{role:'assistant',text:'UI preview only. No model request has been sent.',ts:Date.now()}],pending:[],queue:[]}));
+    if(msg.type==='send')submissions.push(msg);
+    // Messages stop here: this fixture never invokes an agent.
+  });
+});
+let child, connection;
+const errors=[];
+const checks=[];
+const screenshots=[];
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+try {
+  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
+  const base=`http://127.0.0.1:${server.address().port}`;
+  child=spawn(chrome,['--headless=new','--disable-gpu','--disable-background-networking','--disable-component-update','--no-first-run','--no-default-browser-check','--disable-sync',`--user-data-dir=${scratch}`,'--remote-debugging-port=0','about:blank'],{stdio:'ignore'});
+  const active=path.join(scratch,'DevToolsActivePort');
+  for(let i=0;i<200&&!fs.existsSync(active);i++)await wait(50);
+  assert(fs.existsSync(active),'Chrome debugging endpoint not available');
+  const debug=`http://127.0.0.1:${fs.readFileSync(active,'utf8').split('\n')[0]}`;
+  const targets=await (await fetch(debug+'/json/list')).json();
+  connection=new WebSocket(targets.find(t=>t.type==='page').webSocketDebuggerUrl);
+  await new Promise((resolve,reject)=>{connection.onopen=resolve;connection.onerror=reject;});
+  let next=0;const pending=new Map();
+  const call=(method,params={})=>new Promise((resolve,reject)=>{const id=++next;pending.set(id,{resolve,reject});connection.send(JSON.stringify({id,method,params}));});
+  connection.onmessage=ev=>{
+    const m=JSON.parse(ev.data);
+    if(m.id){const p=pending.get(m.id);pending.delete(m.id);m.error?p.reject(new Error(m.error.message)):p.resolve(m.result);}
+    if(m.method==='Runtime.exceptionThrown')errors.push(m.params.exceptionDetails.exception?.description || m.params.exceptionDetails.text);
+    if(m.method==='Fetch.requestPaused')call(m.params.request.url.startsWith(base+'/')?'Fetch.continueRequest':'Fetch.failRequest',{requestId:m.params.requestId,...(m.params.request.url.startsWith(base+'/')?{}:{errorReason:'BlockedByClient'})}).catch(()=>{});
+  };
+  await call('Runtime.enable');await call('Page.enable');await call('Fetch.enable',{patterns:[{urlPattern:'*'}]});
+  const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw new Error(r.exceptionDetails.text);return r.result.value;};
+  const screenshot=async name=>{await wait(300);const shot=await call('Page.captureScreenshot',{format:'png'});const file=path.join(scratch,name+'.png');fs.writeFileSync(file,Buffer.from(shot.data,'base64'));screenshots.push(file);};
+  const until=async expression=>{for(let i=0;i<100;i++){if(await evaluate(expression))return;await wait(50);}throw new Error('Timed out: '+expression);};
+  await call('Emulation.setDeviceMetricsOverride',{width:1440,height:960,deviceScaleFactor:1,mobile:false});
+  await call('Page.navigate',{url:base});
+  await until('document.querySelector(".roster-chip")?.textContent.includes("Mia")');
+  assert.equal(await evaluate('document.title'),'StateX HQ');checks.push('office brand and Mia roster');
+  assert(await evaluate('document.querySelector("#office").width>0 && ["pixelated","crisp-edges"].includes(getComputedStyle(document.querySelector("#office")).imageRendering)'));checks.push('pixel-art canvas rendered');
+  assert(await evaluate('document.querySelector(".labels").classList.contains("dark")'),'default cyberpunk theme uses readable room labels');
+  await screenshot('office');
+  await evaluate('document.querySelector(".roster-chip").click()');
+  await until('document.body.classList.contains("chat-open") && document.querySelector("#chatBody").textContent.includes("UI preview only")');checks.push('Mia chat opens');
+  assert.deepEqual(await evaluate('({name:document.querySelector("#chatName").textContent,role:document.querySelector("#chatRole").textContent,model:document.querySelector("#chatModel").title,status:document.querySelector("#chatStatus").textContent})'),{name:mia.name,role:mia.role,model:mia.model,status:locale.status.idle});
+  checks.push('agent card displays supplied name, role, model and status');
+  await screenshot('agent-card');
+  await evaluate('document.querySelector("#chatInput").value="Offline transport check";document.querySelector("#chatForm").requestSubmit()');
+  for(let i=0;i<50&&!submissions.length;i++)await wait(20);
+  assert.equal(submissions[0]?.text,'Offline transport check');assert.equal(submissions[0]?.id,'mia');checks.push('chat submission reaches mock transport only');
+  await evaluate('document.querySelector("#btnClose").click();document.querySelector("#btnBoard").click()');
+  await until('!document.querySelector("#boardModal").hidden && document.querySelector("#officeMode").value==="manual"');
+  await evaluate('document.querySelector("#boardClose").click();document.querySelector("#btnMeeting").click()');
+  await until('!document.querySelector("#meetStartModal").hidden && document.querySelector("#meetPick input").value==="mia"');
+  await evaluate('document.querySelector("#meetNone").click()');
+  assert.equal(await evaluate('document.querySelectorAll("#meetPick input:checked").length'),0);
+  await evaluate('document.querySelector("#meetAll").click()');
+  assert.equal(await evaluate('document.querySelectorAll("#meetPick input:checked").length'),1);
+  await evaluate('document.querySelector("#meetStartCancel").click();document.querySelector("#btnSettings").click()');
+  checks.push('Board opens in manual mode; Meeting selection and cancellation work');
+  await until('!document.querySelector("#settingsModal").hidden');
+  await evaluate('document.querySelector("#settingsTabs [data-tab=models]").click()');
+  await until('document.querySelector("#provList").textContent.includes("cohere/north-mini-code:free")');checks.push('Settings native OpenRouter and free-model hint');
+  await evaluate('document.querySelector(".prov-card[data-id=openrouter]").scrollIntoView({block:"center"})');
+  await wait(250);
+  await screenshot('settings');
+  await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  await evaluate('document.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape"}))');await wait(200);
+  assert(await evaluate('document.documentElement.scrollWidth<=window.innerWidth'));checks.push('mobile viewport without document overflow');
+  await evaluate('document.querySelector(".roster-chip").click()');
+  await until('document.body.classList.contains("chat-open")');await wait(300);
+  assert(await evaluate('document.querySelector("#chat").scrollWidth<=document.querySelector("#chat").clientWidth'));
+  assert(await evaluate('["btnProfile","btnStop","btnReset","btnClose"].every(id=>{const r=document.getElementById(id).getBoundingClientRect();return r.left>=0&&r.right<=innerWidth})'));
+  checks.push('mobile agent card and chat controls stay within viewport');
+  await screenshot('mobile-agent');
+  await call('Emulation.setDeviceMetricsOverride',{width:820,height:1180,deviceScaleFactor:1,mobile:true});await wait(300);
+  assert(await evaluate('document.documentElement.scrollWidth<=innerWidth'));checks.push('tablet viewport without overflow');
+  await screenshot('tablet');
+  await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});
+  assert(await evaluate('matchMedia("(prefers-reduced-motion: reduce)").matches'));checks.push('reduced-motion preference supported');
+  await call('Page.navigate',{url:base+'/employee.html?office=main&id=mia'});
+  await until('document.querySelector("#pName")?.textContent==="Mia"');
+  await until('document.querySelector("#fModel .choice.on")?.dataset.value==="openrouter:cohere/north-mini-code:free"');
+  assert.equal(await evaluate('document.querySelector("#fPerm .choice.on").dataset.value'),'default');
+  await wait(150);
+  assert.equal(await evaluate('document.title'),'Mia — StateX HQ');checks.push('employee profile and configured model');
+  await call('Page.navigate',{url:base+'/hire.html?office=main'});
+  await until('document.querySelector("#editor")?.children.length>0 && document.querySelector("#permCards .choice.on")');checks.push('hire screen remains available');
+  assert.deepEqual(errors,[],'no browser JavaScript exceptions');
+  await call('Browser.close');
+  console.log(JSON.stringify({checks,errors,providerCalls:0,screenshots,fixture:'Mock API only; not a real OpenRouter connection'},null,2));
+} finally {
+  connection?.close();
+  if(child && child.exitCode===null) {for(let i=0;i<30&&child.exitCode===null;i++)await wait(50);if(child.exitCode===null)child.kill('SIGTERM');}
+  for(const socket of wss.clients)socket.terminate();
+  wss.close();await new Promise(resolve=>server.close(resolve));
+}

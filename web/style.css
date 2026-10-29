@@ -1,12 +1,12 @@
 :root {
-  --bg: #14151c;
-  --bg-2: #1c1e28;
-  --panel: #1a1c26;
-  --card: #20222e;
-  --line: #2e3140;
-  --text: #e8e6df;
-  --muted: #8b8f9e;
-  --accent: #ffd166;
+  --bg: #090f19;
+  --bg-2: #101a28;
+  --panel: #101b29;
+  --card: #152235;
+  --line: #2b4057;
+  --text: #e6f0f7;
+  --muted: #9aacbf;
+  --accent: #56dfcd;
   --idle: #7f8797;
   --working: #4ade80;
   --waiting: #ffd166;
@@ -118,7 +118,7 @@ body.offline .offline-banner { display: block; }
 .labels.compact .label small { display: none; }
 .room-label { position: absolute; transform: translate(-50%, 0); font-family: "Silkscreen", monospace; font-size: 9px; letter-spacing: 2px; color: rgba(40, 30, 20, .45); white-space: nowrap; }
 .labels.compact .room-label { display: none; }
-.labels.dark .room-label { color: rgba(255, 240, 220, .45); }
+.labels.dark .room-label { color: #a8c1ce; text-shadow: 0 1px 2px #101827; }
 
 .roster { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 14px; }
 .roster-chip {
@@ -616,3 +616,46 @@ body.offline .chat-foot button { background: var(--line); color: var(--muted); c
 .idea-tag { display: inline-block; margin: 0 6px 4px 0; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--accent); font: inherit; font-size: 11px; cursor: pointer; }
 .idea-tag:hover { border-color: var(--accent); }
 .idea-tag:focus-visible, .idea-ctx .queue-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* StateX HQ: a small visual layer; canvas, layout and controls remain upstream. */
+.topbar {
+  background: linear-gradient(100deg, #101a28, #0e1826);
+  box-shadow: 0 1px 0 #56dfcd18, 0 8px 24px #0003;
+}
+.brand { letter-spacing: .06em; font-size: 14px; }
+.brand-dot { background: var(--accent); box-shadow: 0 0 14px #56dfcd66; }
+.stage {
+  background: radial-gradient(ellipse at 50% 38%, #172b4238, transparent 68%), var(--bg);
+}
+.office-tab.on { background: #56dfcd12; }
+.roster-chip.selected { background: #56dfcd0c; }
+.chat, .modal-card, .menu-pop { box-shadow: 0 16px 48px #0006; }
+.btn, .icon-btn, .office-tab { transition: border-color .15s, background-color .15s; }
+.btn:focus-visible, .icon-btn:focus-visible, .office-tab:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 3px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn, .icon-btn, .office-tab { transition: none; }
+}
+
+/* StateX cyberpunk: static surfaces, real agent fields, original interaction targets. */
+:root { --violet: #a58adb; }
+.stage { background: radial-gradient(ellipse at 75% 80%, #30224435, transparent 65%), radial-gradient(ellipse at 20% 0%, #17434b55, transparent 70%), var(--bg); }
+.roster-chip { background: linear-gradient(135deg, #192c3b, #1d2236); border-color: #365064; }
+#chat > .agent-card { flex-wrap: wrap; gap: 10px; padding: 16px; margin: 12px 12px 0; border: 1px solid #3b596c; border-top: 2px solid var(--accent); border-radius: 14px; background: linear-gradient(125deg, #172f3c, #252238); box-shadow: 0 6px 22px #0003; }
+.agent-card .chat-avatar { width: 60px; height: 60px; background-size: 60px 43px; border: 1px solid #a58adb80; border-radius: 12px; box-shadow: 0 0 14px #56dfcd15; }
+.agent-card .chat-title { flex: 1 1 calc(100% - 80px); }
+.agent-card .chat-name { font-size: 20px; gap: 6px; }
+.agent-card .chat-name > span:first-child { white-space: normal; overflow-wrap: anywhere; }
+.agent-card .model-badge { max-width: 100%; white-space: normal; overflow-wrap: anywhere; color: #c9b8eb; background: #101b2d80; }
+#chat .agent-card .chat-role { font-size: 12px; gap: 8px; margin-top: 8px; overflow-wrap: anywhere; }
+.agent-card .icon-btn { flex: none; border: 1px solid var(--line); background: #101c2c; }
+.agent-card #btnProfile { margin-right: auto; }
+.agent-card .chip.idle { color: var(--accent); }
+.modal-card { border-top-color: var(--violet); }
+@media (max-width: 760px) {
+  #chat > .agent-card { margin: 8px 8px 0; padding: 12px; }
+  .agent-card .chat-avatar { width: 48px; height: 48px; background-size: 48px 34px; }
+  .agent-card .chat-title { flex-basis: calc(100% - 68px); }
+  .agent-card .chat-name { font-size: 18px; }
+}

@@ -4139,8 +4139,8 @@
       "contextTip": "Context: what the model re-reads at every step",
       "costTip": "Spent today"
     },
-    "title": "Pixel Office",
-    "brand": "OFFICE",
+    "title": "StateX HQ",
+    "brand": "StateX HQ",
     "legend": {
       "idle": "Idle",
       "working": "Working",
@@ -4872,6 +4872,7 @@
         "modelsTitle": "{n} models",
         "noModels": "No models yet.",
         "custom": "Extra model ids (comma separated)",
+        "freeHint": "Free-model example: cohere/north-mini-code:free. Add its ID, then select it in Mia’s profile. Confirm current input/output prices and tool support before running a task.",
         "prices": {
           "title": "Token prices (USD per 1M tokens)",
           "hint": "Your rows come first (first match wins) and sit in {file}. Grey built-in rows are read-only. The pattern is a regular expression tested against the model id.",

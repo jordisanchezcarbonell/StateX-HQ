@@ -104,11 +104,11 @@ class Office {
 
   setTheme(name) {
     const next = THEMES[name] ? name : "default";
+    this.labelsEl.classList.toggle("dark", !!THEMES[next].dark);
     if (next === this.theme) return;
     this.theme = next;
     this.buildStatic();
     for (const { r, el } of this.roomEls) el.textContent = roomName(this.theme, r.key);
-    this.labelsEl.classList.toggle("dark", !!(THEMES[this.theme] || {}).dark);
   }
 
   // ---------- layout ----------
@@ -624,7 +624,7 @@ class Office {
       const feet = (d.ty + 1) * TILE;
       const who = sitting.get(d.id) || deskStub(d);
       items.push({ y: feet - 24, draw: faded(d.id, () => drawChair(b, d.tx * TILE, feet)) });
-      items.push({ y: feet + TILE + 6, draw: faded(d.id, () => drawDesk(b, who, t)) });
+      items.push({ y: feet + TILE + 6, draw: faded(d.id, () => drawDesk(b, who, t, this.theme === "default")) });
     }
     for (const e of this.emps) {
       if (e.seat.none) { const feet = (e.seat.ty + 1) * TILE; items.push({ y: feet - 24, draw: () => drawChair(b, e.seat.tx * TILE, feet) }); }
@@ -1176,7 +1176,8 @@ function drawFloors(b, theme = "default", rugs = [POLayout.defaultRug()], dim = 
   for (const r of ROOMS) {
     const x = r.x0 * TILE, y = r.y0 * TILE, w = (r.x1 - r.x0 + 1) * TILE, h = (r.y1 - r.y0 + 1) * TILE;
     const floor = T.floors[r.key] || r.floor;
-    if (floor === "wood") drawWood(b, x, y, w, h);
+    if (floor === "statex") drawStateXFloor(b, x, y, w, h, r.key);
+    else if (floor === "wood") drawWood(b, x, y, w, h);
     else if (floor === "tiles") drawTiles(b, x, y, w, h);
     else if (floor === "carpet") drawCarpet(b, x, y, w, h);
     else if (floor === "turf") drawTurf(b, x, y, w, h);
@@ -1197,12 +1198,31 @@ function drawFloors(b, theme = "default", rugs = [POLayout.defaultRug()], dim = 
     else drawConcrete(b, x, y, w, h);
   }
   // door thresholds
-  b.fillStyle = "#c9a273";
+  b.fillStyle = theme === "default" ? "#294757" : "#c9a273";
   for (const [x, y] of [[7, 5], [7, 6], [22, 5], [22, 6], [7, 12], [7, 13], [22, 12], [22, 13], [3, 9], [4, 9], [25, 9], [26, 9]]) b.fillRect(x * TILE, y * TILE, TILE, TILE);
   // the rugs (movable pieces; the classic one lies in the lounge)
   for (const r of rugs) {
     if (dim && r.id === dim) { b.save(); b.globalAlpha = 0.3; drawRug(b, r.skin || theme, r.tx, r.ty); b.restore(); } else drawRug(b, r.skin || theme, r.tx, r.ty);
   }
+}
+
+// Static pixel panels and low-intensity edge lighting; no extra animation loop or post-processing.
+function drawStateXFloor(b, x, y, w, h, room) {
+  const violet = room === "meeting" || room === "archive";
+  b.fillStyle = violet ? "#202338" : "#162d38"; b.fillRect(x, y, w, h);
+  for (let py = y; py < y + h; py += TILE) {
+    for (let px = x; px < x + w; px += TILE) {
+      b.fillStyle = (px / TILE + py / TILE) % 2 ? "#253541" : "#21303b";
+      b.fillRect(px + 1, py + 1, TILE - 2, TILE - 2);
+      b.fillStyle = violet ? "#353950" : "#2a424e";
+      b.fillRect(px + 3, py + 3, TILE - 6, 1);
+    }
+  }
+  b.fillStyle = violet ? "#514777" : "#24575e"; b.fillRect(x + 3, y + 3, w - 6, 2);
+  b.fillStyle = violet ? "#9c7adb" : "#50b7b1";
+  for (let px = x + 12; px < x + w - 12; px += 64) b.fillRect(px, y + 3, 12, 1);
+  b.fillStyle = violet ? "rgba(158,117,232,.06)" : "rgba(80,223,205,.05)";
+  b.fillRect(x + 3, y + 5, w - 6, 12);
 }
 
 function drawWood(b, x, y, w, h) {
@@ -1287,6 +1307,20 @@ function drawWalls(b, blocked, doors, t, theme = "default", wall = POLayout.defa
   // windows with blinds (open office)
   const sky = skyColors();
   for (const wx of [9 * TILE, 17 * TILE]) {
+    if (theme === "default") {
+      // Decorative skyline, not a dashboard: no invented activity or telemetry.
+      outlineRect(b, wx - 4, 4, 104, 48, "#172534");
+      b.fillStyle = "#0e1729"; b.fillRect(wx, 8, 96, 40);
+      for (let i = 0; i < 8; i++) {
+        const h = 12 + (i * 7 % 23), bx = wx + i * 12;
+        b.fillStyle = i % 2 ? "#243747" : "#2c2c47"; b.fillRect(bx, 48 - h, 10, h);
+        b.fillStyle = i % 2 ? "#4b8e95" : "#79649e";
+        for (let row = 0; row < h - 5; row += 7) b.fillRect(bx + 3, 45 - h + row, 3, 2);
+      }
+      b.fillStyle = "#407e85"; b.fillRect(wx, 48, 96, 2);
+      b.fillStyle = "#294957"; b.fillRect(wx + 47, 8, 2, 40);
+      continue;
+    }
     b.fillStyle = "#eef2f4"; b.fillRect(wx - 4, 4, 104, 48);
     b.fillStyle = "#c9d3d8"; b.fillRect(wx - 4, 50, 104, 3);
     const g = b.createLinearGradient(0, 8, 0, 48);
@@ -1711,7 +1745,7 @@ function drawWorkDeskProps(b, e, t, x, y) {
   }
 }
 
-function drawDesk(b, e, t) {
+function drawDesk(b, e, t, cyber = false) {
   const x = (e.seat.tx - 1) * TILE, y = (e.seat.ty + 1) * TILE;
   const status = e.status;
   // feet under the desk (seen through the gap between the desk legs)
@@ -1725,14 +1759,15 @@ function drawDesk(b, e, t) {
     b.fillStyle = "#2b2d3a"; b.fillRect(x + 46, y + 22, 4, 8); b.fillRect(x + 40, y + 29, 16, 2);
   }
   // desk body: top surface, apron, legs (open underneath)
-  outlineRect(b, x + 2, y, 92, 22, "#a8734a");
-  b.fillStyle = "#c58f60"; b.fillRect(x + 2, y, 92, 4);
-  b.fillStyle = "#7a4d2c"; b.fillRect(x + 2, y + 17, 92, 5);
-  b.fillStyle = "#5c3618"; b.fillRect(x + 2, y + 21, 92, 1);
-  outlineRect(b, x + 4, y + 22, 6, 10, "#5c3618"); outlineRect(b, x + 86, y + 22, 6, 10, "#5c3618");
-  b.fillStyle = "#7a4d2c"; b.fillRect(x + 5, y + 22, 2, 9); b.fillRect(x + 87, y + 22, 2, 9);
+  outlineRect(b, x + 2, y, 92, 22, cyber ? "#263e50" : "#a8734a");
+  b.fillStyle = cyber ? "#3a596a" : "#c58f60"; b.fillRect(x + 2, y, 92, 4);
+  b.fillStyle = cyber ? "#253145" : "#7a4d2c"; b.fillRect(x + 2, y + 17, 92, 5);
+  b.fillStyle = cyber ? "#151f30" : "#5c3618"; b.fillRect(x + 2, y + 21, 92, 1);
+  outlineRect(b, x + 4, y + 22, 6, 10, cyber ? "#151f30" : "#5c3618"); outlineRect(b, x + 86, y + 22, 6, 10, cyber ? "#151f30" : "#5c3618");
+  b.fillStyle = cyber ? "#253145" : "#7a4d2c"; b.fillRect(x + 5, y + 22, 2, 9); b.fillRect(x + 87, y + 22, 2, 9);
   // wood grain
   b.fillStyle = "rgba(255,255,255,.08)"; b.fillRect(x + 12, y + 7, 30, 1); b.fillRect(x + 50, y + 12, 24, 1);
+  if (cyber) { b.fillStyle = "#62c7c0"; b.fillRect(x + 5, y + 19, 86, 1); b.fillStyle = "#9675d1"; b.fillRect(x + 6, y + 23, 2, 7); b.fillRect(x + 88, y + 23, 2, 7); }
   // keyboard + mouse
   outlineRect(b, x + 32, y + 7, 28, 8, "#3b3f4a");
   b.fillStyle = "#6b7080"; for (let r = 0; r < 2; r++) for (let i = 0; i < 8; i++) b.fillRect(x + 34 + i * 3, y + 9 + r * 3, 2, 2);
@@ -1759,8 +1794,8 @@ function drawDesk(b, e, t) {
     b.fillStyle = "#f87171"; b.fillRect(sx + 7, sy + 5, 2, 2); b.fillRect(sx + 17, sy + 5, 2, 2); b.fillRect(sx + 9, sy + 13, 8, 2);
   } else {
     b.fillStyle = "#1c2433"; b.fillRect(sx, sy, 26, 18);
-    b.fillStyle = "#33415c"; b.fillRect(sx + 3, sy + 4, 16, 2); b.fillRect(sx + 3, sy + 8, 10, 2); b.fillRect(sx + 3, sy + 12, 13, 2);
-    b.fillStyle = "#4a6a9c"; b.fillRect(sx + 20, sy + 12, 4, 4);
+    b.fillStyle = cyber ? "#4b8a94" : "#33415c"; b.fillRect(sx + 3, sy + 4, 16, 2); b.fillRect(sx + 3, sy + 8, 10, 2); b.fillRect(sx + 3, sy + 12, 13, 2);
+    b.fillStyle = cyber ? "#9b7bd2" : "#4a6a9c"; b.fillRect(sx + 20, sy + 12, 4, 4);
   }
   b.fillStyle = "#ffd166"; b.fillRect(mx + 30, my + 2, 5, 5);
   // mug (in the employee's hand while sipping)
@@ -1881,7 +1916,7 @@ function drawOverhead(b, e, t, occupied) {
 // ---------- themes ----------
 // Same room layout and walkable tiles for every theme; only palette, floors, wall decor and props change.
 const THEMES = {
-  default: { wall: { face: "#6f8896", top: "#7f98a6", base: "#5c7280", base2: "#43545f", edge: "#39474f", inner: "#8ea3b0", innerLight: "#a9bcc7", innerDark: "#3f4f5a" }, floors: { kitchen: "tiles", office: "wood", meeting: "carpet", lounge: "wood", archive: "concrete" }, rug: "lounge" },
+  default: { dark: true, wall: { face: "#223649", top: "#4b6679", base: "#254c59", base2: "#192737", edge: "#101827", inner: "#304959", innerLight: "#526e80", innerDark: "#172635" }, floors: { kitchen: "statex", office: "statex", meeting: "statex", lounge: "statex", archive: "statex" }, rug: "lounge" },
   football: { wall: { face: "#2f6b45", top: "#3f8a5a", base: "#25553a", base2: "#1c412c", edge: "#142f20", inner: "#4f7f62", innerLight: "#6c9c7e", innerDark: "#223d2d" }, floors: { kitchen: "tiles", office: "wood", meeting: "turf", lounge: "turf", archive: "concrete" }, rug: "pitch" },
   fashion: { wall: { face: "#e6cfc8", top: "#f2e2dd", base: "#cfb0a8", base2: "#b8968e", edge: "#9f7f78", inner: "#d9bdb6", innerLight: "#ecd6d0", innerDark: "#8f6f68" }, floors: { kitchen: "tiles", office: "wood", meeting: "carpetLight", lounge: "marble", archive: "wood" }, rug: "round" },
 };
@@ -2695,7 +2730,7 @@ function renderThemePreview(theme, width = 240) {
   for (const seat of [{ tx: 11, ty: 5 }, { tx: 17, ty: 5 }, { tx: 11, ty: 11 }, { tx: 17, ty: 11 }]) {
     const feet = (seat.ty + 1) * TILE;
     items.push({ y: feet - 24, draw: () => drawChair(b, seat.tx * TILE, feet) });
-    items.push({ y: feet + TILE + 6, draw: () => drawDesk(b, { seat, tx: -1, ty: -1, path: [], status: "idle", color: "#61afef", look: {}, seed: 0 }, 5000) });
+    items.push({ y: feet + TILE + 6, draw: () => drawDesk(b, { seat, tx: -1, ty: -1, path: [], status: "idle", color: "#61afef", look: {}, seed: 0 }, 5000, theme === "default") });
   }
   items.sort((a, c) => a.y - c.y);
   for (const it of items) it.draw(b);
@@ -2757,7 +2792,7 @@ function renderItemThumb(theme, type, skin) {
     const list = [];
     if (type === "desk") {
       const feet = (it.ty + 1) * TILE;
-      list.push({ y: feet - 24, draw: () => drawChair(b, it.tx * TILE, feet) }, { y: feet + TILE + 6, draw: () => drawDesk(b, deskStub({ tx: it.tx, ty: it.ty }), 0) });
+      list.push({ y: feet - 24, draw: () => drawChair(b, it.tx * TILE, feet) }, { y: feet + TILE + 6, draw: () => drawDesk(b, deskStub({ tx: it.tx, ty: it.ty }), 0, theme === "default") });
     } else itemDecor(theme, it, list);
     list.sort((a, c) => a.y - c.y);
     for (const d of list) d.draw(b, 0);

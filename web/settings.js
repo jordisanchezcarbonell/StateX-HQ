@@ -180,7 +180,7 @@ const settingsUI = (() => {
           <button class="btn small primary" data-act="saveKey">${escapeHtml(t("ui.settings.models.keySave"))}</button>${p.keyHint && p.keyHint !== "env" ? `<button class="btn small ghost" data-act="removeKey">${escapeHtml(t("ui.settings.models.keyRemove"))}</button>` : ""}
           ${p.keyHint ? `<small class="muted">${escapeHtml(t("ui.settings.models.keyFrom", { hint: p.keyHint === "env" ? t("ui.settings.models.keyEnv") : p.keyHint }))}</small>` : ""}</div>` : "";
       const customRow = p.id === "gemini" || p.id === "openrouter" ? `<div class="prov-key"><label><span>${escapeHtml(t("ui.settings.models.custom"))}</span><input type="text" data-custom-input value="${escapeHtml((p.custom || []).join(", "))}" /></label>
-          <button class="btn small ghost" data-act="saveModels">${escapeHtml(t("ui.settings.models.customSave"))}</button></div>` : "";
+          <button class="btn small ghost" data-act="saveModels">${escapeHtml(t("ui.settings.models.customSave"))}</button></div>${p.id === "openrouter" ? `<small class="muted">${escapeHtml(t("ui.settings.models.freeHint"))}</small>` : ""}` : "";
       const chips = p.models.length ? p.models.map((m) => `<span class="chip" title="${escapeHtml(MODEL_INFO[m.id]?.desc || m.desc || m.id)}">${escapeHtml(m.name)}</span>`).join("") : `<small class="muted">${escapeHtml(t("ui.settings.models.noModels"))}</small>`;
       const stateLine = stateText(p);
       return `<div class="prov-card prov-${badge[0]}" data-id="${p.id}" style="--brand:${BRAND[p.id]}">

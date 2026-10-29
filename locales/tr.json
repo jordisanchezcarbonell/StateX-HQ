@@ -4084,8 +4084,8 @@
       "contextTip": "Bağlam: modelin her adımda yeniden okuduğu miktar",
       "costTip": "Bugünkü harcama"
     },
-    "title": "Ofis",
-    "brand": "OFİS",
+    "title": "StateX HQ",
+    "brand": "StateX HQ",
     "legend": {
       "idle": "Boşta",
       "working": "Çalışıyor",
@@ -4817,6 +4817,7 @@
         "modelsTitle": "{n} model",
         "noModels": "Henüz model yok.",
         "custom": "Ek model kimlikleri (virgülle ayır)",
+        "freeHint": "Ücretsiz model denemesi: cohere/north-mini-code:free ekleyip Mia profilinde seçin. Çalıştırmadan önce güncel giriş/çıkış fiyatlarını ve araç desteğini doğrulayın; bu bağlantı yalnızca ücretsiz kullanım zorlamaz.",
         "prices": {
           "title": "Token fiyatları (1M token başına USD)",
           "hint": "Senin satırların önce denenir (ilk eşleşen kazanır), {file} dosyasında durur. Gri yerleşik satırlar salt okunurdur. Desen, model kimliğine uygulanan bir düzenli ifadedir.",
