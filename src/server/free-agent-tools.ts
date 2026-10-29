@@ -76,7 +76,8 @@ export class WorkspaceTools {
       }
       if (readOnly) fail("read_only");
       // The authorisation list for intel tools is the boss's file: agents may read it, never change it.
-      if (file === path.join(this.root, "scope.json")) fail("path_forbidden");
+      // Case-insensitive, as on APFS "SCOPE.JSON" is the same file (or creates one loadScope will read).
+      if (path.dirname(file) === this.root && path.basename(file).toLowerCase() === "scope.json") fail("path_forbidden");
       if (before !== undefined && this.reads.get(file) !== hash(before)) fail("read_before_write_required");
       let after: string;
       if (name === "Edit") {

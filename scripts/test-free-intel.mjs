@@ -143,6 +143,21 @@ try {
     assert.match(fs.readFileSync(path.join(ws,'scope.json'),'utf8'),/solo\.test\.org/);
   });
 
+  await test('case variants of scope.json are refused too (case-insensitive filesystems such as APFS)',async()=>{
+    const allow=async()=>true;const scopeFile=path.join(ws,'scope.json');const original=fs.readFileSync(scopeFile,'utf8');
+    let tools=new WorkspaceTools(ws);
+    // Read first so the only thing left to stop the writes is the scope.json guard.
+    for(const file_path of ['SCOPE.JSON','Scope.json'])assert.match(await tools.execute('Read',{file_path},signal,allow),/hackerone/);
+    await assert.rejects(tools.execute('Write',{file_path:'SCOPE.JSON',content:'{}'},signal,allow),/path_forbidden/);
+    await assert.rejects(tools.execute('Edit',{file_path:'Scope.json',old_string:'solo.test.org',new_string:'victim.com'},signal,allow),/path_forbidden/);
+    assert.equal(fs.readFileSync(scopeFile,'utf8'),original);
+    // Without scope.json an agent must not be able to create one under another spelling.
+    fs.rmSync(scopeFile);const before=fs.readdirSync(ws).sort();tools=new WorkspaceTools(ws);
+    await assert.rejects(tools.execute('Write',{file_path:'SCOPE.JSON',content:JSON.stringify(SCOPE)},signal,allow),/path_forbidden/);
+    assert.deepEqual(fs.readdirSync(ws).sort(),before);assert.equal(loadScope(ws),undefined);
+    fs.writeFileSync(scopeFile,original);
+  });
+
   await test('runtime: intel tools offered only when granted; tool results go back to the model',async()=>{
     const original=globalThis.fetch;const sent=[];
     const replies=[

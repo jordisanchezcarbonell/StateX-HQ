@@ -26,7 +26,8 @@ Garantías:
   > 64 KB → `scope_invalid`/`out_of_scope` **sin hacer ninguna petición**.
   Las exclusiones ganan a los targets. `subdomains: false` = solo el dominio exacto.
 - **Los agentes leen `scope.json` pero no pueden escribirlo ni editarlo**
-  (`path_forbidden` en `WorkspaceTools`), ni siquiera con aprobación.
+  (`path_forbidden` en `WorkspaceTools`, comparación sin distinguir mayúsculas, por APFS),
+  ni siquiera con aprobación.
 - **Pasivo.** Solo GET a 5 hosts fijos por HTTPS, URL construida por el servidor,
   sin redirecciones, timeout 20 s, límite de tamaño por fuente. El objetivo nunca
   recibe tráfico. No hay URLs libres, shell ni escaneo activo.
@@ -72,7 +73,7 @@ concretas, sin envío de nada fuera, parada ante `out_of_scope`.
 
 ## Validación (offline)
 
-- `node scripts/test-free-intel.mjs`: 12 grupos (dominios, scope, opt-in, cada
+- `node scripts/test-free-intel.mjs`: 13 grupos (dominios, scope, opt-in, cada
   fuente con fetch simulado, errores, protección de scope.json, runtime end-to-end).
   `realNetworkRequests: 0`.
 - `node scripts/test-statex-cyber.mjs`: perfiles parseados con el loader real,
