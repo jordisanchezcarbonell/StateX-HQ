@@ -3,3 +3,5 @@ dist/
 data/
 .DS_Store
 *.log
+.statex-free-dev/
+free-model-router/

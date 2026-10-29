@@ -18,6 +18,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { officeToolDefs } from "./office-tools.js";
 import { initSkills, skillCatalog, viewOfSkill, skillById, previewSkill, installSkill, uninstallSkill, installedIds } from "./skills.js";
 import { CATEGORIES, initIntegrations, listIntegrations, saveIntegration, checkIntegration, removeIntegration, entryOf, startOAuth, finishOAuth, addCustom, gateway, setOwnClient } from "./integrations.js";
+import { freeOnly } from "./free-agent.js";
 import { CLAUDE_MODELS, PROVIDERS, activeModels, isActiveModel, initProviders, providersReady, providerStatuses, updateProvider, installProvider, loginProvider, refreshProvider, canInstall, canLogin, type ProviderId } from "./providers.js";
 import { createGuard, isLoopbackHost } from "./security.js";
 import { acquireLock } from "./lock.js";
@@ -525,7 +526,7 @@ function setUnread(e: Employee, n: number) {
 }
 
 const readText = (p?: string) => { try { return p ? fs.readFileSync(p, "utf8") : ""; } catch { return ""; } };
-const MODELS = CLAUDE_MODELS;
+const MODELS = freeOnly() ? [] : CLAUDE_MODELS;
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const PERMS = ["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"] as const;
 const clean = (v: unknown, max = 200) => (typeof v === "string" ? v.trim().slice(0, max) : "");
@@ -534,7 +535,7 @@ const pick = <T extends string>(v: unknown, list: readonly T[]): T | undefined =
 
 const officeInfo = (o: OfficeRt) => ({ id: o.def.id, name: o.def.name, cwd: o.def.cwd, employeesDir: o.def.employeesDir, theme: o.def.theme });
 const roster = (o: OfficeRt) => [...o.employees.values()].map(publicInfo);
-const syncAgents = (o: OfficeRt) => syncClaudeAgents(o.def, [...o.employees.values()].map((e) => e.cfg));
+const syncAgents = (o: OfficeRt) => { if (!freeOnly()) syncClaudeAgents(o.def, [...o.employees.values()].map((e) => e.cfg)); };
 
 // Client-side strings and options, served as a script so static pages can use them synchronously.
 const clientConfig = () => ({
@@ -915,7 +916,7 @@ r.get("/board/tasks/:id/transcript", async (req: OReq, res) => {
   if (!o || !k) return res.status(404).json({ error: t("server.notFound") });
   const owner = o.employees.get(k.owner);
   if (!k.session) return res.json({ available: false, reason: t("server.runs.noSession"), messages: [] });
-  if (owner?.engine === "codex" || owner?.engine === "gemini" || /^[0-9a-f]{8}-[0-9a-f]{4}-7/i.test(k.session)) return res.json({ available: false, reason: t("server.runs.codex"), messages: [] });
+  if (owner?.engine === "free-agent" || owner?.engine === "codex" || owner?.engine === "gemini" || /^[0-9a-f]{8}-[0-9a-f]{4}-7/i.test(k.session)) return res.json({ available: false, reason: t("server.runs.codex"), messages: [] });
   const messages = await sessionTranscript(k.session, owner?.cfg.cwd ?? o.def.cwd).catch(() => []);
   if (!messages.length) return res.json({ available: false, reason: t("server.runs.notFound"), messages: [] });
   res.json({ available: true, messages });

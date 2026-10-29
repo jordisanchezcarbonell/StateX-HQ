@@ -4836,6 +4836,10 @@
             "name": "Gemini",
             "desc": "Google Gemini CLI, with a Gemini API key."
           },
+          "free-agent": {
+            "name": "StateX Free Agent",
+            "desc": "Local free-only gateway · Read / Write / Edit · approval for every write"
+          },
           "openrouter": {
             "name": "OpenRouter",
             "desc": "Any model OpenRouter serves, with an OpenRouter API key."

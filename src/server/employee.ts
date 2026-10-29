@@ -4,7 +4,6 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
-  query,
   type Query,
   type SDKMessage,
   type SDKUserMessage,
@@ -20,7 +19,9 @@ import { runCodexTurn, skillsIndex, skillFile, type CodexItem } from "./codex.js
 import { runGeminiTurn, type GeminiEvent } from "./gemini.js";
 import { costOf } from "./prices.js";
 import { statusDigest } from "./digest.js";
-import { engineOf, geminiKey, openrouterCatalog, openrouterCostOf, openrouterEnv, openrouterSlug, markAuthFailed, AUTH_ERROR, type Engine } from "./providers.js";
+import { runFreeAgent, freeOnly, type FreeMessage } from "./free-agent.js";
+import { FreeAgentError } from "./free-agent-tools.js";
+import { engineOf, providerEnabled, geminiKey, openrouterCatalog, openrouterCostOf, openrouterEnv, openrouterSlug, markAuthFailed, AUTH_ERROR, type Engine } from "./providers.js";
 import { isTransient, retryDelay, RETRY_DELAYS_MS } from "./retry.js";
 import { listSkills, listProjectSkills } from "./agents.js";
 import { claudeSession, readOnlySession } from "./integrations.js";
@@ -64,10 +65,12 @@ export interface Connector { name: string; status: string; tools: number | null 
 let connectorCache: { at: number; list: Connector[] } | undefined;
 let connectorProbe: Promise<Connector[]> | undefined;
 export function listConnectors(cwd: string, fresh = false): Promise<Connector[]> {
+  if (freeOnly() || !providerEnabled("claude")) return Promise.resolve([]);
   if (!fresh && connectorCache && Date.now() - connectorCache.at < 5 * 60e3) return Promise.resolve(connectorCache.list);
   return (connectorProbe ??= (async () => {
     let release = () => {};
     const silent = (async function* (): AsyncGenerator<SDKUserMessage> { await new Promise<void>((r) => (release = r)); })();
+    const { query } = await import("@anthropic-ai/claude-agent-sdk");
     const q = query({ prompt: silent, options: { cwd, settingSources: [], persistSession: false } });
     try {
       let servers = await q.mcpServerStatus();
@@ -307,7 +310,7 @@ export class Employee extends EventEmitter {
     if (!this.turnOpen) this.applyPending();
     if (this.running && this.runningFor !== key) this.stopQuery();
     // the current state goes in the user message (not the instructions), so the cached prompt stays the same
-    const digest = o.digest ? statusDigest(this.cfg.cwd, this.colleagues?.board().tasks) : "";
+    const digest = o.digest && this.engine !== "free-agent" ? statusDigest(this.cfg.cwd, this.colleagues?.board().tasks) : "";
     const msg = userMsg((o.preamble ? this.takePreamble() : "") + (digest ? digest + "\n\n" : "") + text, o.images);
     if (o.files?.length) this.plain.set(msg, { text: "", files: o.files });
     if (!this.sick) this.setStatus("working");
@@ -937,8 +940,22 @@ export class Employee extends EventEmitter {
     this.runningFor = key;
     if (this.carry.length) this.inbox.unshift(...this.carry.splice(0));
     const gen = this.generation;
+    if ((freeOnly() && this.engine !== "free-agent") || !providerEnabled(this.engine)) {
+      this.inbox = []; this.endTurn("Engine disabled by configuration", 0); this.runningFor = undefined; return;
+    }
+    if (this.engine === "free-agent") { void this.runFree(gen, key); return; }
     if (this.engine === "codex") { void this.runCodex(gen, key); return; }
     if (this.engine === "gemini") { void this.runGemini(gen, key); return; }
+    // Lazy-load optional SDK only when an SDK employee actually runs.
+    this.cx = { kill: () => { this.generation++; } };
+    void this.startClaude(gen, key).catch(err => { if (this.generation === gen) { this.cx = undefined; this.runningFor = undefined; this.failTurn(err); } });
+  }
+
+  private async startClaude(gen: number, key: string) {
+    const { query } = await import("@anthropic-ai/claude-agent-sdk");
+    const officeMcp = this.colleagues ? await officeServer(this, this.colleagues) : undefined;
+    if (this.generation !== gen) return;
+    this.cx = undefined;
     // OpenRouter runs through Claude Code too, pointed at OpenRouter: same tools, permissions and sessions
     const viaOpenRouter = this.engine === "openrouter";
     if (viaOpenRouter) void openrouterCatalog().catch(() => {}); // its prices, before the first result needs them
@@ -971,7 +988,7 @@ export class Employee extends EventEmitter {
         permissionMode: this.cfg.permissionMode ?? "default",
         allowedTools: [...(this.cfg.allowedTools ?? []), ...OFFICE_TOOLS, ...integ.allowed],
         disallowedTools: integ.denied.length ? integ.denied : undefined,
-        mcpServers: this.colleagues || Object.keys(integ.servers).length ? { ...(this.colleagues ? { office: officeServer(this, this.colleagues) } : {}), ...integ.servers } : undefined,
+        mcpServers: this.colleagues || Object.keys(integ.servers).length ? { ...(this.colleagues ? { office: officeMcp! } : {}), ...integ.servers } : undefined,
         model: viaOpenRouter ? openrouterSlug(this.cfg.model!) : this.cfg.model,
         // effort is a Claude setting; other models behind OpenRouter may reject it
         effort: viaOpenRouter ? undefined : this.cfg.effort,
@@ -1173,6 +1190,63 @@ export class Employee extends EventEmitter {
     this.status = "idle"; // not announced yet
     this.afterTurn();
     if (this.status === "idle") this.setStatus("idle");
+  }
+
+  // ---- Free Agent: one bounded OpenAI tool loop, no CLI / SDK / office MCP ----
+  private async runFree(gen: number, key: string) {
+    const controller = new AbortController();
+    this.cx = { kill: () => controller.abort() };
+    try {
+      while (this.generation === gen && this.inbox.length && !this.sick) {
+        const started = Date.now();
+        const batch = this.inbox.splice(0);
+        let detail: string | undefined;
+        try {
+          if (batch.some(m => typeof m.message.content !== "string" || this.plain.get(m)?.files.length)) throw new FreeAgentError("attachments_not_supported");
+          const taskId = taskOf(key);
+          const task = taskId !== undefined ? this.colleagues?.board().tasks.find(t => t.id === taskId) : undefined;
+          const previous = key === "side" ? undefined : taskId !== undefined ? task?.session : this.sessionId;
+          const session = previous?.startsWith("free-agent:") ? previous : `free-agent:${crypto.randomUUID()}`;
+          const histories = this.store.getMeta<Record<string, FreeMessage[]>>(this.cfg.id, "freeAgentHistory") ?? {};
+          if (taskId !== undefined) this.colleagues?.board().markTask(taskId, { session });
+          else if (key === "chat") { this.sessionId = session; this.store.setSession(this.cfg.id, session); }
+          const saveHistory = (history: FreeMessage[]) => {
+            if (key === "side" || this.generation !== gen) return;
+            const next = { ...histories, [session]: history };
+            for (const id of Object.keys(next).slice(0, -20)) delete next[id];
+            this.store.setMeta(this.cfg.id, "freeAgentHistory", next);
+          };
+          await runFreeAgent({
+            cwd: this.cfg.cwd, model: this.cfg.model!, prompt: batch.map(plainText).join("\n\n"),
+            system: this.cfg.systemPrompt, history: histories[session] ?? [], signal: controller.signal, onHistory: saveHistory,
+            readOnly: !!this.meetingTurn || this.cfg.permissionMode === "plan",
+            approve: async (tool, input, signal) => {
+              if (signal.aborted) return false;
+              const decision = await this.canUseTool(tool, input, { signal, requestId: crypto.randomUUID(), description: JSON.stringify(input, null, 2), suppressAlwaysAllowRule: true });
+              return decision.behavior === "allow";
+            },
+            onText: text => { if (this.generation === gen) { this.emit("chunk", text); this.emit("chunk_end"); this.push({ role: "assistant", text, ts: Date.now() }); } },
+            onTool: (name, file) => { if (this.generation === gen) this.push({ role: "activity", text: `${name}: ${file}`, kind: name === "Read" ? "read" : "write", ts: Date.now() }); },
+            onUsage: u => {
+              if (this.generation !== gen) return;
+              this.model = u.model; this.context = u.input;
+              this.turnSpend = { cost: 0, tokens: { input: u.input, output: u.output } }; this.emitSpend(key);
+              this.push({ role: "activity", text: `Free Agent · ${u.model} · tokens ${u.input}/${u.output} · reported cost: ${u.cost === undefined ? "unreported" : "$0"}`, ts: Date.now() });
+            },
+          });
+          if (this.generation !== gen) return;
+        } catch (err) { detail = err instanceof FreeAgentError ? err.message : "free-agent: execution_failed"; }
+        if (this.generation !== gen) return;
+        const more = !detail && this.inbox.length > 0 && !controller.signal.aborted;
+        this.endTurn(detail, Date.now() - started, false, more);
+        if (detail) break;
+      }
+    } finally {
+      if (this.generation === gen) {
+        this.cx = undefined; this.runningFor = undefined;
+        if (this.inbox.length && !this.sick) this.start(key);
+      }
+    }
   }
 
   // ---- Codex engine: a process per turn, the conversation kept by thread id ----
@@ -1396,7 +1470,7 @@ export class Employee extends EventEmitter {
   // as before (the task is blocked). False = not a case for a retry; the caller handles the error as usual.
   private retryLater(key: string | undefined, detail: string): boolean {
     const taskId = taskOf(key);
-    if (taskId === undefined || this.disposed || !isTransient(detail)) return false;
+    if (this.engine === "free-agent" || taskId === undefined || this.disposed || !isTransient(detail)) return false;
     const attempt = (this.retries.get(key!) ?? 0) + 1;
     const wait = retryDelay(attempt);
     const max = RETRY_DELAYS_MS.length;

@@ -14,14 +14,17 @@ const chrome=process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents
 assert(fs.existsSync(chrome),'Install Chrome or set CHROME_BIN; this test never downloads dependencies');
 const scratch=fs.mkdtempSync(path.join(os.tmpdir(),'statex-ui-'));
 const locale=JSON.parse(fs.readFileSync('locales/en.json','utf8'));
-const model={id:'openrouter:cohere/north-mini-code:free',name:'North Mini Code (free)',desc:'UI fixture; not a real provider connection',provider:'openrouter'};
-const mia={id:'mia',office:'main',name:'Mia',role:'Software Developer',color:'#56dfcd',look:defaultLook('mia','#56dfcd'),engine:'openrouter',status:'idle',model:model.id,cost:0,context:0,queued:0,manager:false};
+const freeMode=process.argv.includes('--free');
+const openrouterModel={id:'openrouter:cohere/north-mini-code:free',name:'North Mini Code (free)',desc:'UI fixture; not a real provider connection',provider:'openrouter'};
+const freeModel={id:'free-agent:auto',name:'StateX Free Agent (auto)',desc:'UI fixture; free-only gateway',provider:'free-agent'};
+const model=freeMode?freeModel:openrouterModel;
+const mia={id:'mia',office:'main',name:'Mia',role:'Software Developer',color:'#56dfcd',look:defaultLook('mia','#56dfcd'),engine:freeMode?'free-agent':'openrouter',status:'idle',model:model.id,cost:0,context:0,queued:0,manager:false};
 const office={id:'main',name:'StateX HQ',cwd:'/temporary-ui-fixture',theme:'default'};
 const board={tasks:[],notes:[],ideas:[],mode:'manual',budget:10,roundsPerDay:3,cycle:{phase:'idle',no:0,spent:0,tasks:[]}};
-const providers=['claude','codex','gemini','openrouter'].map(id=>({id,enabled:true,connected:id==='openrouter',installed:true,version:'',detail:id==='openrouter'?'apiKey':'signedOut',models:id==='openrouter'?[model]:[],custom:id==='openrouter'?['cohere/north-mini-code:free']:[],canInstall:false,canLogin:false}));
+const providers=['claude','codex','gemini','openrouter','free-agent'].map(id=>({id,enabled:true,connected:id==='openrouter'||id==='free-agent',installed:true,version:'',detail:id==='openrouter'?'apiKey':'signedOut',models:id==='openrouter'?[openrouterModel]:id==='free-agent'?[freeModel]:[],custom:id==='openrouter'?['cohere/north-mini-code:free']:[],canInstall:false,canLogin:false}));
 const app=express();
-app.get('/i18n.js',(_req,res)=>res.type('js').send('window.PO='+JSON.stringify({locale:'en',locales:[{code:'en',name:'English'}],strings:{ui:locale.ui,rooms:locale.rooms,status:locale.status},models:['claude-sonnet-5-5'],extraModels:[model],efforts:['low','medium','high'],permissions:['default','plan'],themes:['default'],project:office.cwd,projectDisplay:office.cwd,mode:'project',root:office.cwd,firstRun:false,memoryFile:'memory.md',multiOffice:true,defaultOffice:'main',offices:[office]})+';'));
-app.get('/api/providers',(_req,res)=>res.json({providers,extraModels:[model]}));
+app.get('/i18n.js',(_req,res)=>res.type('js').send('window.PO='+JSON.stringify({locale:'en',locales:[{code:'en',name:'English'}],strings:{ui:locale.ui,rooms:locale.rooms,status:locale.status},models:['claude-sonnet-5-5'],extraModels:[openrouterModel,freeModel],efforts:['low','medium','high'],permissions:['default','plan'],themes:['default'],project:office.cwd,projectDisplay:office.cwd,mode:'project',root:office.cwd,firstRun:false,memoryFile:'memory.md',multiOffice:true,defaultOffice:'main',offices:[office]})+';'));
+app.get('/api/providers',(_req,res)=>res.json({providers,extraModels:[openrouterModel,freeModel]}));
 app.get('/api/prices',(_req,res)=>res.json({file:'UI fixture',custom:{codex:[],gemini:[]},defaults:{codex:[],gemini:[]}}));
 app.get('/api/settings',(_req,res)=>res.json({sickness:false,syncClaudeAgents:false,refreshHours:24,compactAtTokens:190000,taskSessions:true,envLocked:{},port:0,host:'127.0.0.1'}));
 app.get('/api/offices/main/employees/mia/detail',(_req,res)=>res.json({...mia,configuredModel:model.id,officeName:'StateX HQ',cwd:office.cwd,workdir:office.cwd,officeCwd:office.cwd,permissionMode:'default',allowedTools:[],prompt:'UI fixture only',memory:'',skills:[],projectSkills:[],integrations:[],connectorsOff:[],recent:[],stats:{messages:0,tasks:0},hired:'2026-10-29'}));
@@ -40,7 +43,14 @@ wss.on('connection',ws=>{
   ws.on('message',raw=>{
     const msg=JSON.parse(raw);
     if(msg.type==='open')ws.send(JSON.stringify({type:'history',office:'main',id:'mia',messages:[{role:'assistant',text:'UI preview only. No model request has been sent.',ts:Date.now()}],pending:[],queue:[]}));
-    if(msg.type==='send')submissions.push(msg);
+    if(msg.type==='send'){
+      submissions.push(msg);
+      if(freeMode) ws.send(JSON.stringify({type:'ask',office:'main',id:'mia',request:{requestId:'offline-edit',kind:'permission',toolName:'Edit',title:'Edit README.md',description:'Replace the fixture heading after approval.',input:{file_path:'README.md',old_string:'Fixture',new_string:'StateX'},canAlwaysAllow:false}}));
+    }
+    if(msg.type==='reply'){
+      submissions.push(msg);ws.send(JSON.stringify({type:'ask_done',office:'main',id:'mia',requestId:msg.requestId}));
+      ws.send(JSON.stringify({type:'result',office:'main',id:'mia',model:'fixture/free',cost:0,context:30,durationMs:1}));
+    }
     // Messages stop here: this fixture never invokes an agent.
   });
 });
@@ -87,6 +97,14 @@ try {
   await evaluate('document.querySelector("#chatInput").value="Offline transport check";document.querySelector("#chatForm").requestSubmit()');
   for(let i=0;i<50&&!submissions.length;i++)await wait(20);
   assert.equal(submissions[0]?.text,'Offline transport check');assert.equal(submissions[0]?.id,'mia');checks.push('chat submission reaches mock transport only');
+  if(freeMode){
+    await until('document.querySelector("[data-ask=offline-edit] .ok")');
+    assert.equal(await evaluate('document.querySelectorAll("[data-ask=offline-edit] .always").length'),0);
+    await evaluate('document.querySelector("[data-ask=offline-edit] .ok").click()');
+    await until('!document.querySelector("[data-ask=offline-edit]") && document.querySelector("#chatModel").title==="fixture/free"');
+    assert(submissions.some(m=>m.type==='reply'&&m.requestId==='offline-edit'&&m.allow===true));
+    checks.push('free-agent write approval uses native chat and displays actual model');
+  }
   await evaluate('document.querySelector("#btnClose").click();document.querySelector("#btnBoard").click()');
   await until('!document.querySelector("#boardModal").hidden && document.querySelector("#officeMode").value==="manual"');
   await evaluate('document.querySelector("#boardClose").click();document.querySelector("#btnMeeting").click()');
@@ -100,6 +118,7 @@ try {
   await until('!document.querySelector("#settingsModal").hidden');
   await evaluate('document.querySelector("#settingsTabs [data-tab=models]").click()');
   await until('document.querySelector("#provList").textContent.includes("cohere/north-mini-code:free")');checks.push('Settings native OpenRouter and free-model hint');
+  if(freeMode) { assert(await evaluate('document.querySelector(".prov-card[data-id=free-agent]").textContent.includes("StateX Free Agent")'));checks.push('Free Agent available in existing Settings'); }
   await evaluate('document.querySelector(".prov-card[data-id=openrouter]").scrollIntoView({block:"center"})');
   await wait(250);
   await screenshot('settings');
@@ -119,7 +138,7 @@ try {
   assert(await evaluate('matchMedia("(prefers-reduced-motion: reduce)").matches'));checks.push('reduced-motion preference supported');
   await call('Page.navigate',{url:base+'/employee.html?office=main&id=mia'});
   await until('document.querySelector("#pName")?.textContent==="Mia"');
-  await until('document.querySelector("#fModel .choice.on")?.dataset.value==="openrouter:cohere/north-mini-code:free"');
+  await until(`document.querySelector("#fModel .choice.on")?.dataset.value===${JSON.stringify(model.id)}`);
   assert.equal(await evaluate('document.querySelector("#fPerm .choice.on").dataset.value'),'default');
   await wait(150);
   assert.equal(await evaluate('document.title'),'Mia — StateX HQ');checks.push('employee profile and configured model');

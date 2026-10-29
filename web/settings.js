@@ -166,7 +166,7 @@ const settingsUI = (() => {
     if (!prices && !priceErr.load) loadPrices();
     if (!prov) { host.innerHTML = `<div class="muted">${escapeHtml(provError ? t("ui.settings.unavailable", { message: provError }) : t("ui.settings.loading"))}</div>`; if (!provError && !busy.size) loadProviders(); return; }
     if (host.contains(document.activeElement) && /INPUT|TEXTAREA/.test(document.activeElement.tagName)) return; // typing: do not redraw under the cursor
-    const BRAND = { claude: "#d97757", codex: "#10a37f", gemini: "#4f8ff7", openrouter: "#a78bfa" };
+    const BRAND = { "free-agent": "#56dfcd", claude: "#d97757", codex: "#10a37f", gemini: "#4f8ff7", openrouter: "#a78bfa" };
     const PKG = { claude: "@anthropic-ai/claude-code", codex: "@openai/codex", gemini: "@google/gemini-cli" };
     const openPrices = new Set([...host.querySelectorAll("details[data-prices][open]")].map((d) => d.dataset.prices));
     host.innerHTML = prov.providers.map((p) => {
@@ -185,7 +185,7 @@ const settingsUI = (() => {
       const stateLine = stateText(p);
       return `<div class="prov-card prov-${badge[0]}" data-id="${p.id}" style="--brand:${BRAND[p.id]}">
         <div class="prov-top">
-          <span class="prov-mark" aria-hidden="true"><i style="--logo:url(/logos/${p.id}.svg)"></i></span>
+          <span class="prov-mark" aria-hidden="true"><i style="--logo:url(${p.id === "free-agent" ? "/statex.svg" : `/logos/${p.id}.svg`})"></i></span>
           <div class="prov-title">
             <div class="prov-name"><b>${escapeHtml(t(`ui.settings.models.p.${p.id}.name`))}</b><span class="prov-pill"><i></i>${escapeHtml(t(`ui.settings.models.${badge[1]}`))}</span>${p.version ? `<small class="muted">${escapeHtml(t("ui.settings.models.version", { v: p.version }))}</small>` : ""}</div>
             <small class="muted">${escapeHtml(t(`ui.settings.models.p.${p.id}.desc`))}</small>

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { EventEmitter } from "node:events";
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { freeOnly } from "./free-agent.js";
 import type { Employee, ImageInput } from "./employee.js";
 import type { Store } from "./store.js";
 import { t } from "./runtime.js";
@@ -179,7 +179,7 @@ export class Meeting extends EventEmitter {
     for (const e of this.people) {
       if (!this.joined.has(e.cfg.id)) continue;
       e.meetingOver(title, this.summary);
-      if (opts.memory && this.summary && e.cfg.memoryFile) {
+      if (e.engine !== "free-agent" && opts.memory && this.summary && e.cfg.memoryFile) {
         try { fs.appendFileSync(e.cfg.memoryFile, `\n\n## ${t("server.meeting.memoryTitle", { date: new Date().toISOString().slice(0, 10), topic: title })}\n\n${this.summary}\n`); } catch {}
       }
     }
@@ -195,6 +195,8 @@ export class Meeting extends EventEmitter {
 
   // A small one-shot model call with no tools; the result is a summary plus follow-up tasks per person.
   private async summarize() {
+    if (freeOnly() || this.people.some(e => e.engine === "free-agent")) throw new Error("Automatic meeting summaries are unavailable for free-agent MVP");
+    const { query } = await import("@anthropic-ai/claude-agent-sdk");
     const names = this.people.map((e) => e.cfg.name).join(", ");
     const q = query({
       prompt: t("server.meeting.summaryPrompt", { topic: this.topic || t("server.meeting.untitled"), names, transcript: this.plainTranscript() }),

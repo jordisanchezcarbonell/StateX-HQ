@@ -1,5 +1,5 @@
 import path from "node:path";
-import { getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
+import { freeOnly } from "./free-agent.js";
 import { appendJsonLineSync, readJsonLines } from "./fsutil.js";
 
 // One line per task run: from the moment a task became "doing" until it left it and its owner's turn ended.
@@ -39,6 +39,8 @@ const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s
 const str = (v: unknown) => (typeof v === "string" ? v : JSON.stringify(v ?? ""));
 
 export async function sessionTranscript(session: string, cwd: string): Promise<TranscriptLine[]> {
+  if (freeOnly() || session.startsWith("free-agent:")) return [];
+  const { getSessionMessages } = await import("@anthropic-ai/claude-agent-sdk");
   let msgs = await getSessionMessages(session, { dir: cwd }).catch(() => []);
   if (!msgs.length) msgs = await getSessionMessages(session).catch(() => []); // the folder moved (worktree, new office folder): look everywhere
   const out: TranscriptLine[] = [];

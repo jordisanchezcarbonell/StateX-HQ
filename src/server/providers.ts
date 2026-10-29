@@ -1,3 +1,4 @@
+import { FREE_AGENT_MODEL, gatewayHealthy, freeOnly } from "./free-agent.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,7 +18,7 @@ import { codexModels } from "./codex.js";
 // On/off switches and model lists live in config.json (`providers`); API keys in <dataDir>/secrets.json (0600), which is
 // never in git, not even in project mode, where config.json is.
 
-export const PROVIDERS = ["claude", "codex", "gemini", "openrouter"] as const;
+export const PROVIDERS = ["claude", "codex", "gemini", "openrouter", "free-agent"] as const;
 export type ProviderId = (typeof PROVIDERS)[number];
 export type Engine = ProviderId;
 
@@ -52,10 +53,11 @@ export const OPENROUTER_BASE = "https://openrouter.ai/api";
 // Which engine a model id belongs to. OpenRouter ids carry a prefix ("openrouter:openai/gpt-5"), Gemini ids start with
 // "gemini-", Codex ids come from the Codex account (or look like one); everything else is Claude.
 export function engineOf(model?: string): Engine {
+  if (model?.startsWith("free-agent:")) return "free-agent";
   if (!model) return "claude";
   if (model.startsWith(OPENROUTER_PREFIX)) return "openrouter";
   if (/^gemini-/.test(model)) return "gemini";
-  if (codexModels().some((m) => m.id === model) || /^(gpt-|codex-)/.test(model)) return "codex";
+  if (/^(gpt-|codex-)/.test(model) || (!freeOnly() && codexModels().some((m) => m.id === model))) return "codex";
   return "claude";
 }
 export const openrouterSlug = (model: string) => model.slice(OPENROUTER_PREFIX.length);
@@ -73,9 +75,10 @@ export function initProviders(root: Root, dataDir: string) {
   secretsFile = path.join(dataDir, "secrets.json");
   providersReady = Promise.all(PROVIDERS.map((id) => probe(id))).then(() => undefined);
   // saved OpenRouter models show their names, not only their slugs
-  if (cfgOf("openrouter").models?.length) void openrouterCatalog().catch(() => {});
+  if (enabledOf("openrouter") && cfgOf("openrouter").models?.length) void openrouterCatalog().catch(() => {});
 }
 function cfgOf(id: ProviderId): ProviderCfg {
+  if (!R) return {};
   const all = (readRawConfig(R).providers ?? {}) as Record<string, ProviderCfg>;
   return all[id] ?? {};
 }
@@ -106,7 +109,8 @@ function keyOf(id: ProviderId): { key?: string; from?: "saved" | "env" } {
 }
 const hint = (k: { key?: string; from?: "saved" | "env" }) => (!k.key ? undefined : k.from === "env" ? "env" : `…${k.key.slice(-4)}`);
 // Switched on unless the boss turned it off (a provider that is not connected offers nothing either way).
-const enabledOf = (id: ProviderId) => cfgOf(id).enabled ?? true;
+const enabledOf = (id: ProviderId) => (!freeOnly() || id === "free-agent") && (cfgOf(id).enabled ?? (id !== "free-agent" || freeOnly()));
+export const providerEnabled = enabledOf;
 
 // ---- status: local commands and one HTTP call, no model calls; cached and refreshed in the background ----
 const run = (cmd: string, args: string[], timeout = 8000) => new Promise<{ ok: boolean; out: string }>((resolve) => {
@@ -216,11 +220,15 @@ async function probeOpenRouter(): Promise<Probe> {
     return { connected: false, installed: true, version: "", detail: `offline:${(err as Error).message.slice(0, 80)}` };
   }
 }
-const PROBES: Record<ProviderId, (fresh: boolean) => Promise<Probe>> = { claude: probeClaude, codex: probeCodex, gemini: probeGemini, openrouter: probeOpenRouter };
+const PROBES: Record<ProviderId, (fresh: boolean) => Promise<Probe>> = { claude: probeClaude, codex: probeCodex, gemini: probeGemini, openrouter: probeOpenRouter, "free-agent": async () => {
+  const ok = await gatewayHealthy().catch(() => false);
+  return { connected: ok, installed: true, version: "", detail: ok ? "free-only" : "offline" };
+} };
 
 const probed = new Map<ProviderId, { at: number; value: Probe }>();
 const inflight = new Map<ProviderId, Promise<Probe>>();
 async function probe(id: ProviderId, fresh = false): Promise<Probe> {
+  if (!enabledOf(id)) return { connected: false, installed: true, version: "", detail: "disabled" };
   const c = probed.get(id);
   if (c && !fresh && Date.now() - c.at < 60e3) return c.value;
   let p = inflight.get(id);
@@ -234,6 +242,8 @@ async function probe(id: ProviderId, fresh = false): Promise<Probe> {
 
 // ---- models ----
 function modelsOf(id: ProviderId): ModelEntry[] {
+  if (id === "free-agent") return [{ id: FREE_AGENT_MODEL, name: "StateX Free Agent (auto)", desc: "Free-only local gateway · Read / Write / Edit", provider: id }];
+  if (freeOnly()) return [];
   const custom = cfgOf(id).models ?? [];
   if (id === "claude") return [...CLAUDE_MODELS].map((m) => ({ id: m, name: m, desc: "", provider: id }));
   if (id === "codex") return codexModels().map((m) => ({ id: m.id, name: m.name, desc: m.desc, provider: id }));
@@ -255,7 +265,7 @@ export const isActiveModel = (model: string) => activeModels().some((m) => m.id 
 export async function providerStatuses(fresh = false): Promise<ProviderStatus[]> {
   return Promise.all(PROVIDERS.map(async (id) => {
     const p = await probe(id, fresh);
-    return { id, enabled: enabledOf(id), ...p, keyHint: hint(keyOf(id)), models: modelsOf(id), custom: cfgOf(id).models ?? [] };
+    return { id, enabled: enabledOf(id), ...p, keyHint: freeOnly() ? undefined : hint(keyOf(id)), models: modelsOf(id), custom: cfgOf(id).models ?? [] };
   }));
 }
 
@@ -296,6 +306,7 @@ const orNames = new Map<string, string>();
 interface OrPrice { prompt: number; completion: number; cacheRead?: number; cacheWrite?: number }
 const orPrices = new Map<string, OrPrice>();
 export async function openrouterCatalog(): Promise<OrModel[]> {
+  if (freeOnly()) throw new Error("OpenRouter native catalog disabled in free-only mode");
   if (orCatalog && Date.now() - orCatalog.at < 3600e3) return orCatalog.list;
   const r = await fetch(`${OPENROUTER_BASE}/v1/models`, { signal: AbortSignal.timeout(15000) });
   if (!r.ok) throw new Error(`OpenRouter: HTTP ${r.status}`);
@@ -338,6 +349,7 @@ export function openrouterCostOf(usage: Record<string, OrUsage>, slug: string): 
 const PACKAGES: Partial<Record<ProviderId, string>> = { claude: "@anthropic-ai/claude-code", codex: "@openai/codex", gemini: "@google/gemini-cli" };
 export const canInstall = (id: ProviderId) => !!PACKAGES[id];
 export async function installProvider(id: ProviderId): Promise<{ ok: boolean; output: string }> {
+  if (freeOnly()) return { ok: false, output: "disabled in free-only mode" };
   const pkg = PACKAGES[id];
   if (!pkg) return { ok: false, output: "nothing to install" };
   const r = await new Promise<{ ok: boolean; out: string }>((resolve) => {
@@ -350,6 +362,7 @@ export async function installProvider(id: ProviderId): Promise<{ ok: boolean; ou
 const LOGIN: Partial<Record<ProviderId, string[]>> = { claude: ["claude", "auth", "login"], codex: ["codex", "login"] };
 export const canLogin = (id: ProviderId) => !!LOGIN[id];
 export function loginProvider(id: ProviderId): boolean {
+  if (freeOnly()) return false;
   const cmd = LOGIN[id];
   if (!cmd) return false;
   try {

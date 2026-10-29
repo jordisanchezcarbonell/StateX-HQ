@@ -1,4 +1,3 @@
-import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Employee } from "./employee.js";
 import { TASK_STATUSES, type Board, type Task } from "./board.js";
@@ -26,7 +25,8 @@ export const OFFICE_TOOLS = ["remember", "propose_idea", "list_ideas", "promote_
 const text = (s: string, isError = false) => ({ content: [{ type: "text" as const, text: s }], ...(isError ? { isError: true } : {}) });
 
 // In-process MCP server giving one employee a view of, and a line to, the colleagues in the same office (Claude engine).
-export function officeServer(self: Employee, colleagues: Colleagues) {
+export async function officeServer(self: Employee, colleagues: Colleagues) {
+  const { createSdkMcpServer } = await import("@anthropic-ai/claude-agent-sdk");
   return createSdkMcpServer({
     name: "office",
     version: "1.0.0",
@@ -35,6 +35,10 @@ export function officeServer(self: Employee, colleagues: Colleagues) {
     tools: officeToolDefs(self, colleagues),
   });
 }
+
+// Plain definitions are also served over HTTP; constructing them does not need Claude.
+const tool: typeof import("@anthropic-ai/claude-agent-sdk").tool = (name, description, inputSchema, handler, extras) =>
+  ({ name, description, inputSchema, handler, ...extras });
 
 // The office tools of one employee. Served in-process to Claude, and over HTTP (mcp-http.ts) to engines that are separate programs.
 export function officeToolDefs(self: Employee, colleagues: Colleagues) {
