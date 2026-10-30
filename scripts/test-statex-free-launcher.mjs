@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { startFree, stopFree, launcherPaths, preparePersistentOffice } from './statex-free-launcher.mjs';
+import { loadFreeProviderEnv } from './statex-free-launcher.mjs';
+import { FreeModelRouter } from '../dist/server/free-router.js';
 
 const scratch=fs.mkdtempSync(path.join(os.tmpdir(),'statex-free-launcher-'));
 let passed=0;
@@ -17,7 +19,7 @@ function harness(label) {
   const venvPython=path.join(root,'free-model-router','.venv','bin','python');fs.mkdirSync(path.dirname(venvPython),{recursive:true});
   fs.symlinkSync(frameworkPython,venvPython);
   const pythonExecutable=process.platform==='darwin'?fs.realpathSync(appPython):fs.realpathSync(venvPython);
-  const live=new Map(),foreign=new Map(),proc=new Map(),signals=[],errors=[];
+  const live=new Map(),foreign=new Map(),proc=new Map(),signals=[],errors=[],spawnEnvs=[];
   let nextPid=70000,builds=0;
   const deps={
     portListening:async port=>live.has(port)||foreign.has(port),
@@ -31,6 +33,7 @@ function harness(label) {
       return new Response('not found',{status:404});
     },
     spawn:(cmd,args,options)=>{
+      spawnEnvs.push(options.env);
       const kind=cmd==='bash'?'router':'office',port=kind==='router'?Number(options.env.SERVER_PORT):Number(args[2]);
       const pid=nextPid++,command=kind==='router'?`${pythonExecutable} -m uvicorn main:app --host 127.0.0.1 --port ${port} --no-access-log`:`${process.execPath} ${path.join(root,'scripts','free-office-child.mjs')} ${officeDir} ${port}`;
       const cwd=fs.realpathSync(kind==='router'?path.join(root,'free-model-router'):root);
@@ -44,9 +47,10 @@ function harness(label) {
     kill:(pid,signal)=>{signals.push([pid,signal]);const p=proc.get(pid);if(p){p.active=false;live.delete(p.port);}},
     sleep:async()=>{},
     build:()=>{builds++;},needsBuild:()=>false,
+    loadProviderEnv:()=>({}),
     log:()=>{},error:line=>errors.push(line),
   };
-  return {root,ports,paths,officeDir,live,foreign,proc,signals,errors,pythonExecutable,deps,get builds(){return builds;}};
+  return {root,ports,paths,officeDir,live,foreign,proc,signals,errors,spawnEnvs,pythonExecutable,deps,get builds(){return builds;}};
 }
 function manualRouter(h) {
   const pid=62920, cwd=fs.realpathSync(path.join(h.root,'free-model-router'));
@@ -55,6 +59,38 @@ function manualRouter(h) {
 }
 
 try {
+  await test('loads only protected provider keys from a private file and enables attested Groq offline',async()=>{
+    const dir=path.join(scratch,'provider-env');fs.mkdirSync(dir,{recursive:true,mode:0o700});
+    const envFile=path.join(dir,'free-providers.env');
+    fs.writeFileSync(envFile,'GROQ_API_KEY=fixture-groq-secret\nOPENROUTER_API_KEY=fixture-openrouter-secret\nUNRELATED=value\n',{mode:0o600});
+    // An unsupported entry fails closed; no provider credentials are read from the real home directory.
+    assert.throws(()=>loadFreeProviderEnv(envFile),/unsupported or malformed/);
+    fs.writeFileSync(envFile,'GROQ_API_KEY=fixture-groq-secret\nOPENROUTER_API_KEY=fixture-openrouter-secret\n',{mode:0o600});
+    const loaded=loadFreeProviderEnv(envFile);
+    assert.deepEqual(Object.keys(loaded).sort(),['GROQ_API_KEY','OPENROUTER_API_KEY']);
+    const attestationFile=path.join(dir,'attestations.json');
+    fs.writeFileSync(attestationFile,JSON.stringify({version:1,accounts:{groq:{model:'openai/gpt-oss-20b',freeTierConfirmed:true,billingEnabled:false,autoRecharge:false,verifiedAt:new Date().toISOString()}}}),{mode:0o600});
+    const router=new FreeModelRouter({env:loaded,attestationFile,stateFile:path.join(dir,'state.json')});
+    assert.deepEqual(router.health().providers,['groq']);
+    assert.equal(router.health().status,'ok');
+  });
+  await test('provider environment file rejects insecure modes, symlinks and duplicate keys',async()=>{
+    const dir=path.join(scratch,'provider-env-security');fs.mkdirSync(dir,{recursive:true,mode:0o700});
+    const envFile=path.join(dir,'free-providers.env');fs.writeFileSync(envFile,'GROQ_API_KEY=fixture-secret\n',{mode:0o600});
+    fs.chmodSync(envFile,0o644);assert.throws(()=>loadFreeProviderEnv(envFile),/private, owner-owned/);
+    fs.chmodSync(envFile,0o600);const link=path.join(dir,'link.env');fs.symlinkSync(envFile,link);
+    assert.throws(()=>loadFreeProviderEnv(link),/could not be opened safely/);
+    fs.writeFileSync(envFile,'GROQ_API_KEY=one\nGROQ_API_KEY=two\n',{mode:0o600});
+    assert.throws(()=>loadFreeProviderEnv(envFile),/duplicate provider key/);
+  });
+  await test('dev:free forwards protected provider keys to its office child without logging them',async()=>{
+    const h=harness('provider-env-forward'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'typescript'};
+    h.deps.loadProviderEnv=()=>({GROQ_API_KEY:'fixture-groq-secret',OPENROUTER_API_KEY:'fixture-openrouter-secret'});
+    await startFree(opts,h.deps);
+    const childEnv=h.spawnEnvs.find(x=>x.STATEX_FREE_ROUTER_BACKEND==='typescript');
+    assert.equal(childEnv.GROQ_API_KEY,'fixture-groq-secret');assert.equal(childEnv.OPENROUTER_API_KEY,'fixture-openrouter-secret');
+    assert(!h.errors.join('\n').includes('fixture-'));await stopFree(opts,h.deps);
+  });
   await test('occupied router port with a non-StateX service aborts without killing it',async()=>{
     const h=harness('foreign-router');h.foreign.set(h.ports.router,{type:'router',good:false});
     await assert.rejects(startFree({repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'},h.deps),/health did not match policy free-only/);
@@ -130,6 +166,12 @@ try {
     const config=JSON.parse(fs.readFileSync(path.join(h.officeDir,'.pixel-office','config.json'),'utf8'));
     assert.equal(config.port,h.ports.office);assert.equal(config.host,'127.0.0.1');
     for(const employee of ['alex','mia','sam'])assert.match(fs.readFileSync(path.join(h.officeDir,'.pixel-office','employees',employee,'agent.md'),'utf8'),/model: free-agent:auto/);
+    const alexPrompt=fs.readFileSync(path.join(h.officeDir,'.pixel-office','employees','alex','agent.md'),'utf8');
+    const miaPrompt=fs.readFileSync(path.join(h.officeDir,'.pixel-office','employees','mia','agent.md'),'utf8');
+    assert.match(alexPrompt,/delegate_task when that coordination tool is explicitly available/);
+    assert.doesNotMatch(alexPrompt,/Do not use .*delegation/);
+    assert.match(miaPrompt,/submit_task_result is available/);
+    assert.doesNotMatch(miaPrompt,/Do not use .*delegation/);
     const marker=path.join(h.officeDir,'user-data.txt');fs.writeFileSync(marker,'preserve me');
     const stopped=await stopFree(opts,h.deps);assert.deepEqual(stopped.stopped.sort(),['office','router']);assert.equal(h.live.size,0);assert(!fs.existsSync(h.paths.stateFile));assert.equal(fs.readFileSync(marker,'utf8'),'preserve me');
   });

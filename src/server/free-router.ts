@@ -6,7 +6,7 @@ import os from "node:os";
 export type FreeProvider = "groq" | "openrouter";
 export type FreeRouterTrace = { executionId: string; requestId: string; iteration: number; agentId?: string; taskId?: number | null };
 export class FreeRouterError extends Error {
-  constructor(readonly code: string) { super(`free-router: ${code}`); this.name = "FreeRouterError"; }
+  constructor(readonly code: string, readonly retryAt?: number) { super(`free-router: ${code}`); this.name = "FreeRouterError"; }
 }
 
 const GROQ_MODEL = "openai/gpt-oss-20b";
@@ -44,6 +44,16 @@ function parseRetryAfter(value: string | null, now: number): number | undefined 
   const until = Number.isFinite(secs) && secs >= 0 ? now + secs * 1000 : Date.parse(value);
   return Number.isFinite(until) && until > now ? Math.min(until, now + 24 * 60 * 60 * 1000) : undefined;
 }
+function parseReset(value: string | null, now: number): number | undefined {
+  if (!value) return;
+  const direct = parseRetryAfter(value, now);
+  if (direct) return direct;
+  // Groq uses duration strings such as "1m2s" for token reset headers.
+  const parts = [...value.matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h)/g)];
+  if (!parts.length || parts.map(x => x[0]).join("") !== value.trim()) return;
+  const ms = parts.reduce((sum, part) => sum + Number(part[1]) * ({ ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[part[2] as "ms" | "s" | "m" | "h"]), 0);
+  return Number.isFinite(ms) && ms > 0 ? Math.min(now + ms, now + 24 * 60 * 60 * 1000) : undefined;
+}
 function safeErrorCode(body: unknown): string | undefined {
   if (!body || typeof body !== "object") return;
   const e = (body as any).error;
@@ -64,6 +74,7 @@ export class FreeModelRouter {
   private stateFile: string;
   private attestationFile: string;
   private env: NodeJS.ProcessEnv;
+  private providerLocks = new Map<FreeProvider, Promise<void>>();
   constructor(options: RouterOptions = {}) {
     this.fetcher = options.fetch ?? fetch; this.now = options.now ?? Date.now;
     this.stateFile = options.stateFile ?? process.env.STATEX_FREE_ROUTER_STATE ?? DEFAULT_STATE;
@@ -93,6 +104,21 @@ export class FreeModelRouter {
     for (const [key, value] of Object.entries({ ...state.providers, ...state.models })) if (value && value.until > now) limited[key] = value.until;
     return { status: enabled.length ? "ok" : "unavailable", policy: "free-only", providers: enabled, limited };
   }
+  /** True only when an attested provider is outside its persisted cooldown. */
+  hasAvailableProvider() {
+    const health = this.health(), state = this.state(), now = this.now();
+    return health.providers.some(provider => (state.providers[provider]?.until ?? 0) <= now && (state.models[`${provider}/${provider === "groq" ? GROQ_MODEL : OPENROUTER_MODEL}`]?.until ?? 0) <= now);
+  }
+  private async withProviderLock<T>(provider: FreeProvider, fn: () => Promise<T>): Promise<T> {
+    const previous = this.providerLocks.get(provider) ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const tail = previous.then(() => held);
+    this.providerLocks.set(provider, tail);
+    await previous;
+    try { return await fn(); }
+    finally { release(); if (this.providerLocks.get(provider) === tail) this.providerLocks.delete(provider); }
+  }
   async complete(input: unknown, signal?: AbortSignal, trace?: FreeRouterTrace): Promise<unknown> {
     const payload = validatePayload(input);
     const health = this.health();
@@ -103,15 +129,21 @@ export class FreeModelRouter {
     if (health.providers.includes("openrouter")) candidates.push({ provider: "openrouter", model: OPENROUTER_MODEL });
     let attempted = 0;
     for (const [candidateIndex, candidate] of candidates.entries()) {
-      const key = `${candidate.provider}/${candidate.model}`;
-      if ((state.providers[candidate.provider]?.until ?? 0) > this.now() || (state.models[key]?.until ?? 0) > this.now()) continue;
-      attempted++;
       try {
-        if (candidate.provider === "openrouter") await this.verifyOpenRouterModel(signal);
-        SAFE_LOG("selected", { ...traceFields(trace), attempt: candidateIndex + 1, provider: candidate.provider, model: candidate.model });
-        const result = await this.call(candidate, payload, signal);
-        SAFE_LOG("response", { ...traceFields(trace), attempt: candidateIndex + 1, provider: candidate.provider, model: candidate.model, finish_reason: result.choices?.[0]?.finish_reason ?? null, prompt_tokens: result.usage?.prompt_tokens ?? null, completion_tokens: result.usage?.completion_tokens ?? null, cost: result.usage?.cost ?? null });
-        return result;
+        const outcome = await this.withProviderLock(candidate.provider, async () => {
+          if (signal?.aborted) throw new FreeRouterError("cancelled");
+          state = this.state();
+          const key = `${candidate.provider}/${candidate.model}`;
+          const until = Math.max(state.providers[candidate.provider]?.until ?? 0, state.models[key]?.until ?? 0);
+          if (until > this.now()) return { retryAt: until };
+          attempted++;
+          if (candidate.provider === "openrouter") await this.verifyOpenRouterModel(signal);
+          SAFE_LOG("selected", { ...traceFields(trace), attempt: candidateIndex + 1, provider: candidate.provider, model: candidate.model });
+          const result = await this.call(candidate, payload, signal);
+          SAFE_LOG("response", { ...traceFields(trace), attempt: candidateIndex + 1, provider: candidate.provider, model: candidate.model, finish_reason: result.choices?.[0]?.finish_reason ?? null, prompt_tokens: result.usage?.prompt_tokens ?? null, completion_tokens: result.usage?.completion_tokens ?? null, cost: result.usage?.cost ?? null });
+          return { result };
+        });
+        if ("result" in outcome) return outcome.result;
       } catch (error) {
         if (signal?.aborted) throw new FreeRouterError("cancelled");
         const failure = error instanceof CandidateFailure ? error : new CandidateFailure("transport_error", 0, undefined);
@@ -119,21 +151,27 @@ export class FreeModelRouter {
         const until = this.cooldown(candidate, failure);
         state = this.state();
         const bucket = { until, reason: failure.code };
-        if (failure.scope === "model") state.models[key] = bucket; else state.providers[candidate.provider] = bucket;
+        if (failure.scope === "model") state.models[`${candidate.provider}/${candidate.model}`] = bucket; else state.providers[candidate.provider] = bucket;
         this.persist(state);
         SAFE_LOG("fallback", { ...traceFields(trace), attempt: candidateIndex + 1, provider: candidate.provider, model: candidate.model, reason: failure.code, status: failure.status, scope: failure.scope ?? "provider", retryAt: new Date(until).toISOString() });
       }
     }
     const code = attempted ? "free_providers_exhausted" : "free_providers_cooling_down_or_unverified";
-    SAFE_LOG("exhausted", { ...traceFields(trace), attempted, reason: code });
-    throw new FreeRouterError(code);
+    state = this.state();
+    const retryAt = candidates.flatMap(candidate => [
+      state.providers[candidate.provider]?.until ?? 0,
+      state.models[`${candidate.provider}/${candidate.model}`]?.until ?? 0,
+    ]).filter(x => x > this.now()).sort((a, b) => a - b)[0];
+    SAFE_LOG("exhausted", { ...traceFields(trace), attempted, reason: code, retryAt: retryAt ? new Date(retryAt).toISOString() : null });
+    throw new FreeRouterError(code, retryAt);
   }
   private cooldown(candidate: { provider: FreeProvider; model: string }, failure: CandidateFailure) {
     const now = this.now();
     if (failure.retryAt && failure.retryAt > now) return failure.retryAt;
     if (failure.status === 402 || failure.status === 403 || failure.status === 401 || failure.code === "billing_rejected") return now + 24 * 3600_000;
-    if (failure.status === 429 && failure.scope === "account") return now + 24 * 3600_000;
     if (failure.status === 429 && failure.scope === "day") return now + 24 * 3600_000;
+    if (failure.status === 429 && failure.code === "token_limit") return now + 60_000;
+    if (failure.status === 429 && failure.scope === "account") return now + 24 * 3600_000;
     if (failure.status === 429 && failure.scope === "minute") return now + 60_000;
     if (failure.status === 429 && failure.scope === "model") return now + 60_000;
     if (failure.status >= 500 || failure.status === 0) return now + 30_000;
@@ -162,11 +200,26 @@ export class FreeModelRouter {
     if (!response.ok) {
       let errorBody: unknown; try { errorBody = await response.clone().json(); } catch { /* malformed body */ }
       const scope = classifyLimit(response, errorBody);
-      throw new CandidateFailure(safeErrorCode(errorBody) ?? `http_${response.status}`, response.status, parseRetryAfter(response.headers.get("retry-after"), this.now()), scope);
+      const retryAt = parseRetryAfter(response.headers.get("retry-after"), this.now())
+        ?? parseReset(response.headers.get("x-ratelimit-reset-tokens"), this.now())
+        ?? parseReset(response.headers.get("x-ratelimit-reset-requests"), this.now());
+      throw new CandidateFailure(safeErrorCode(errorBody) ?? `http_${response.status}`, response.status, retryAt, scope);
     }
     let result: any; try { result = await response.json(); } catch { throw new CandidateFailure("invalid_response", response.status); }
     if (!validResponse(result, candidate.model)) throw new CandidateFailure("invalid_response", response.status);
     if (result.usage && result.usage.cost !== undefined && !isZero(result.usage.cost)) throw new CandidateFailure("positive_cost", response.status);
+    if (groq) {
+      const remainingHeader = response.headers.get("x-ratelimit-remaining-tokens");
+      const remaining = remainingHeader !== null && /^\d+$/.test(remainingHeader) ? Number(remainingHeader) : undefined;
+      const resetAt = parseReset(response.headers.get("x-ratelimit-reset-tokens"), this.now());
+      const promptEstimate = Math.ceil(Buffer.byteLength(JSON.stringify({ messages: payload.messages, tools: payload.tools })) / 3);
+      if (remaining !== undefined && Number.isSafeInteger(remaining) && resetAt && remaining < promptEstimate + payload.max_tokens) {
+        const state = this.state();
+        state.providers.groq = { until: resetAt, reason: "token_limit" };
+        this.persist(state);
+        SAFE_LOG("quota_cooldown", { provider: "groq", model: candidate.model, reason: "token_limit", remainingTokens: remaining, estimatedNextRequestTokens: promptEstimate + payload.max_tokens, retryAt: new Date(resetAt).toISOString() });
+      }
+    }
     return result;
   }
 }

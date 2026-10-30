@@ -62,6 +62,29 @@ try {
     assert.equal(JSON.stringify(posted.init.headers).includes('mock-or-secret'),true); // transport only; logs are asserted separately below
     const persisted=JSON.parse(fs.readFileSync(stateFile,'utf8'));assert(persisted.providers.groq.until===now+120000);
   });
+  await test('account token-limit 429 persists a shared retryAt and recovers after the TPM reset',async()=>{
+    fs.writeFileSync(stateFile,JSON.stringify({version:1,providers:{},models:{}}),{mode:0o600});
+    const q=fetchSequence([()=>new Response(JSON.stringify({error:{message:'token limit exceeded for account'}}),{status:429,headers:{'x-ratelimit-reset-tokens':'45s'}})]);
+    const groqOnly={GROQ_API_KEY:env.GROQ_API_KEY},r=router(q.fetch,{env:groqOnly});
+    await assert.rejects(r.complete(req),e=>e instanceof FreeRouterError&&e.code==='free_providers_exhausted'&&e.retryAt===now+45000);
+    assert.equal(JSON.parse(fs.readFileSync(stateFile,'utf8')).providers.groq.until,now+45000);
+    assert.equal(r.hasAvailableProvider(),false);
+    const recovered=router(fetchSequence([()=>Response.json(finalResponse())]).fetch,{env:groqOnly,now:now+46000});
+    assert.equal(recovered.hasAvailableProvider(),true);
+    assert.equal((await recovered.complete(req)).model,'openai/gpt-oss-20b');
+  });
+  await test('serializes same-account requests and applies shared TPM headroom before the next call',async()=>{
+    fs.writeFileSync(stateFile,JSON.stringify({version:1,providers:{},models:{}}),{mode:0o600});
+    let release;const responseGate=new Promise(resolve=>{release=resolve;});
+    const q=fetchSequence([async()=>{await responseGate;return new Response(JSON.stringify(finalResponse()),{headers:{'content-type':'application/json','x-ratelimit-remaining-tokens':'100','x-ratelimit-reset-tokens':'30s'}});}]);
+    const r=router(q.fetch,{env:{GROQ_API_KEY:env.GROQ_API_KEY}});
+    const first=r.complete(req),second=r.complete(req);
+    await new Promise(resolve=>setTimeout(resolve,0));assert.equal(q.seen.length,1);
+    release();await first;
+    await assert.rejects(second,e=>e instanceof FreeRouterError&&e.code==='free_providers_cooling_down_or_unverified'&&e.retryAt===now+30000);
+    assert.equal(q.seen.length,1,'second agent must not spend a request after shared token headroom is insufficient');
+    assert.equal(JSON.parse(fs.readFileSync(stateFile,'utf8')).providers.groq.reason,'token_limit');
+  });
   await test('daily/account 429 is persisted at provider scope so another model cannot bypass a shared quota',async()=>{
     fs.writeFileSync(stateFile,JSON.stringify({version:1,providers:{},models:{}}),{mode:0o600});
     const q=fetchSequence([()=>new Response(JSON.stringify({error:{message:'daily request quota reached'}}),{status:429}),catalog,()=>Response.json(finalResponse('cohere/north-mini-code:free'))]);

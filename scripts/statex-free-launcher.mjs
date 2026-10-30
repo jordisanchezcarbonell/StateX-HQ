@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SAFE_ENV_KEYS = ['PATH','HOME','USER','LOGNAME','TMPDIR','TEMP','TMP','LANG','LC_ALL','LC_CTYPE','SYSTEMROOT','WINDIR','STATEX_FREE_ROUTER_URL','STATEX_FREE_MAX_REQUESTS','STATEX_FREE_MAX_ITERATIONS','STATEX_FREE_MAX_OUTPUT_TOKENS','STATEX_FREE_MAX_TOTAL_TOKENS','STATEX_FREE_MAX_TOOLS','STATEX_FREE_ROUTER_BACKEND','STATEX_FREE_ROUTER_STATE','STATEX_FREE_ATTESTATION_FILE','GROQ_API_KEY','OPENROUTER_API_KEY'];
+const FREE_PROVIDER_ENV_KEYS = ['GROQ_API_KEY','OPENROUTER_API_KEY'];
+const FREE_PROVIDER_ENV_FILE = path.join(os.homedir(), '.config', 'statex-hq', 'free-providers.env');
 const HEALTH_PATH = '/health';
 
 export const launcherPaths = (root = repoRoot) => {
@@ -57,15 +59,42 @@ const defaultDeps = {
   sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
   log: (line) => console.log(line),
   error: (line) => console.error(line),
+  loadProviderEnv: () => loadFreeProviderEnv(),
 };
 
 function mergeDeps(deps) { return { ...defaultDeps, ...deps }; }
 function processFingerprint(command,cwd,executable) { return crypto.createHash('sha256').update(`${command}\0${cwd}\0${executable}`).digest('hex'); }
 function canonicalPath(value) { try { return fs.realpathSync(value); } catch { return path.resolve(value); } }
 function jsonResponse(ok, body) { return { ok, json: async () => body }; }
-function safeEnv(extra = {}) {
+export function loadFreeProviderEnv(file = FREE_PROVIDER_ENV_FILE) {
+  let fd;
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0)); }
+  catch (error) { if (error.code === 'ENOENT') return {}; throw new Error('Free provider environment file could not be opened safely'); }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || (st.mode & 0o077) !== 0 || st.size > 4096 || (typeof process.getuid === 'function' && st.uid !== process.getuid())) {
+      throw new Error('Free provider environment file must be a private, owner-owned regular file no larger than 4 KiB');
+    }
+    const content = fs.readFileSync(fd, 'utf8');
+    const result = {};
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+      if (!match || !FREE_PROVIDER_ENV_KEYS.includes(match[1])) throw new Error('Free provider environment file contains an unsupported or malformed entry');
+      if (Object.hasOwn(result, match[1])) throw new Error('Free provider environment file contains a duplicate provider key');
+      let value = match[2];
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+      if (!value || value.length > 1024 || /[\s\0"']/.test(value)) throw new Error('Free provider environment file contains an invalid key value');
+      result[match[1]] = value;
+    }
+    return result;
+  } finally { fs.closeSync(fd); }
+}
+function safeEnv(extra = {}, providerEnv = {}) {
   const env = {};
   for (const key of SAFE_ENV_KEYS) if (process.env[key] !== undefined) env[key] = process.env[key];
+  for (const key of FREE_PROVIDER_ENV_KEYS) if (process.env[key] === undefined && typeof providerEnv[key] === 'string') env[key] = providerEnv[key];
   return { ...env, ...extra };
 }
 function readState(file, officeDir) {
@@ -199,8 +228,8 @@ function configFor(port) {
   };
 }
 const agentProfiles = {
-  mia: `---\nname: Mia\nrole: Software Developer\nmodel: free-agent:auto\npermissionMode: default\ncolor: '#56dfcd'\n---\nYou are Mia, a software developer at StateX HQ. Work only in this isolated workspace. Use the available file tools and request approval for writes. Do not use shell commands, network access, delegation, or other workspaces.\n`,
-  alex: `---\nname: Alex\nrole: Personal Assistant\nmodel: free-agent:auto\npermissionMode: default\ncolor: '#9b8cff'\n---\nYou are Alex, a personal assistant at StateX HQ. Work only in this isolated workspace. Use the available file tools and request approval for writes. Do not use shell commands, network access, delegation, or other workspaces.\n`,
+  mia: `---\nname: Mia\nrole: Software Developer\nmodel: free-agent:auto\npermissionMode: default\ncolor: '#56dfcd'\n---\nYou are Mia, a software developer at StateX HQ. Work only in this isolated workspace. Use the available file tools and request approval for writes. Do not use shell commands, network access, or other workspaces. When assigned a Board task and submit_task_result is available, return a concise structured result after rereading your changes.\n`,
+  alex: `---\nname: Alex\nrole: Personal Assistant\nmodel: free-agent:auto\npermissionMode: default\ncolor: '#9b8cff'\n---\nYou are Alex, a personal assistant at StateX HQ. Work only in this isolated workspace. Use the available file tools and request approval for writes. Do not use shell commands, network access, or other workspaces. Delegate to Mia only through delegate_task when that coordination tool is explicitly available; wait for her structured result and verify it yourself before reporting completion.\n`,
   sam: `---\nname: Sam\nrole: Marketing & Ads\nmodel: free-agent:auto\npermissionMode: default\ncolor: '#ffb85c'\n---\nYou are Sam, a marketing specialist at StateX HQ. Work only in this isolated workspace. Use the available file tools and request approval for writes. Do not use shell commands, network access, delegation, or other workspaces.\n`,
 };
 function writeNew(file, contents) { fs.mkdirSync(path.dirname(file),{recursive:true}); try { fs.writeFileSync(file,contents,{flag:'wx',mode:0o600}); return true; } catch(e) { if(e.code==='EEXIST') return false; throw e; } }
@@ -254,8 +283,8 @@ function startGatewayProcess(root,port,deps) {
   const env=safeEnv({SERVER_HOST:'127.0.0.1',SERVER_PORT:String(port)});
   return deps.spawn('bash',[path.join(routerDir,'run.sh')],{cwd:routerDir,env,detached:true,stdio:'inherit'});
 }
-function startOfficeProcess(root,officeDir,port,deps,backend='typescript') {
-  const env=safeEnv({STATEX_FREE_ONLY:'1',STATEX_FREE_ROUTER_BACKEND:backend==='legacy'?'python':backend,PIXEL_OFFICE_MODE:'project',PIXEL_OFFICE_ROOT:officeDir,PORT:String(port),PIXEL_OFFICE_OPEN:'0'});
+function startOfficeProcess(root,officeDir,port,deps,backend='typescript',providerEnv={}) {
+  const env=safeEnv({STATEX_FREE_ONLY:'1',STATEX_FREE_ROUTER_BACKEND:backend==='legacy'?'python':backend,PIXEL_OFFICE_MODE:'project',PIXEL_OFFICE_ROOT:officeDir,PORT:String(port),PIXEL_OFFICE_OPEN:'0'},providerEnv);
   return deps.spawn(process.execPath,[path.join(root,'scripts','free-office-child.mjs'),officeDir,String(port)],{cwd:root,env,detached:true,stdio:'inherit'});
 }
 async function waitForReady(kind,port,officeDir,deps,signal,timeout=15000) {
@@ -343,7 +372,8 @@ export async function startFree(options={},providedDeps={}) {
       checkAbort();
       if(deps.needsBuild(root)) deps.build(root);
       checkAbort();
-      const child=startOfficeProcess(root,officeDir,officePort,deps,backend);
+      const providerEnv=deps.loadProviderEnv();
+      const child=startOfficeProcess(root,officeDir,officePort,deps,backend,providerEnv);
       handles.push({child,kind:'office'});checkAbort();
       await recordFor('office',child,root,officePort,officeDir,deps,options.signal,record=>{state.processes.office=record;started.push(record);persist();});
       if(!await waitForReady('office',officePort,officeDir,deps,options.signal)) throw new Error('StateX HQ did not become ready in free-only mode; see its terminal output');

@@ -22,6 +22,7 @@ import { statusDigest } from "./digest.js";
 import { runFreeAgent, createFreeAgentBudget, freeOnly, type FreeAgentBudget, type FreeMessage } from "./free-agent.js";
 import { isIntelTool } from "./free-agent-intel.js";
 import { FreeAgentError } from "./free-agent-tools.js";
+import { freeAgentCoordination } from "./free-agent-coordination.js";
 import { engineOf, providerEnabled, geminiKey, openrouterCatalog, openrouterCostOf, openrouterEnv, openrouterSlug, markAuthFailed, AUTH_ERROR, type Engine } from "./providers.js";
 import { isTransient, retryDelay, RETRY_DELAYS_MS } from "./retry.js";
 import { listSkills, listProjectSkills } from "./agents.js";
@@ -465,10 +466,16 @@ export class Employee extends EventEmitter {
     return this.beginTask(id, from) ? "started" : "queued";
   }
 
+  async cancelTask(id: number): Promise<boolean> {
+    this.taskQueue = this.taskQueue.filter((item) => item.id !== id);
+    if (this.taskId === id) await this.interrupt({ task: "todo", resume: false });
+    return true;
+  }
+
   private beginTask(id: number, from?: Employee): boolean {
     const board = this.colleagues?.board();
     const k = board?.tasks.find((x) => x.id === id);
-    if (!board || !k || k.status === "done" || k.owner !== this.cfg.id) return false;
+    if (!board || !k || k.status === "done" || k.owner !== this.cfg.id || (k.coordination && k.coordination.status !== "assigned")) return false;
     this.taskId = id;
     if (this.freeTaskBudget?.id !== id) this.freeTaskBudget = undefined;
     if (this.taskTalkFor !== id) { this.taskTalk = []; this.taskTalkFor = id; }
@@ -1124,7 +1131,7 @@ export class Employee extends EventEmitter {
   }
 
   // The end of a turn, whichever engine ran it. `detail` = what went wrong, if anything; `more` = another turn follows at once.
-  private endTurn(detail: string | undefined, durationMs: number, sessionLost = false, more = false) {
+  private endTurn(detail: string | undefined, durationMs: number, sessionLost = false, more = false, retryAt?: number) {
     this.flushStream();
     const key = this.runningFor;
     this.emitSpend(key);
@@ -1149,11 +1156,28 @@ export class Employee extends EventEmitter {
     // the chat session learns what the refresh changed, instead of hearing nothing of it
     if (key === "side" && !detail && turn.trim()) this.addPreamble(tt("server.refreshNote", "[Note: in a separate short session you tidied your memory file. What you reported: {summary}]", { summary: clip(turn.replace(/\s+/g, " "), 800) }));
     this.closeTurn(turn);
+    const delegatedId = taskOf(key);
+    const delegated = delegatedId !== undefined ? this.colleagues?.board().tasks.find((x) => x.id === delegatedId) : undefined;
+    if (delegated?.coordination?.worker === this.cfg.id && !detail) {
+      if (["review", "completed"].includes(delegated.coordination.status) && delegated.coordination.result) {
+        const coordinator = this.colleagues?.list().find((e) => e.cfg.id === delegated.coordination!.coordinator);
+        if (coordinator && delegated.coordination.status === "completed") {
+          coordinator.note(`Task #${delegated.id} completed after its structured result and objective acceptance checks were verified locally.`);
+        } else if (coordinator && !delegated.coordination.reviewNotification) {
+          const sentAt = Date.now();
+          this.colleagues?.board().setCoordination(delegated.id, { reviewNotification: { sentTo: coordinator.cfg.id, sentAt }, by: "system", detail: "single coordinator review notification dispatched" });
+          void coordinator.sendFromColleague(this, JSON.stringify({ type: "delegated_task_result", task_id: delegated.id, status: "review", result: delegated.coordination.result }), false);
+        }
+      } else if (delegated.coordination.status === "running") {
+        this.colleagues?.board().setCoordination(delegated.id, { status: "failed", error: "worker_finished_without_structured_result", by: "system" });
+        this.colleagues?.board().updateTask(delegated.id, { status: "blocked", note: "Worker ended without submitting a structured result." }, "system");
+      }
+    }
     this.unanswered = []; // answered, or failed in plain sight: either way not something to replay later
     if (!detail) this.recovered = false;
     else if (!wasInterrupted) this.push({ role: "system", text: t("server.turnError", { detail }), ts: Date.now() });
     if (wasInterrupted) return; // interrupt() does the rest
-    if (detail) this.blockTaskOnError(key, detail);
+    if (detail) this.blockTaskOnError(key, detail, retryAt);
     this.emit("result", { cost: this.cost, durationMs, context: this.context });
     this.applyPending();
     if (this.pending.size === 0) this.settle();
@@ -1161,11 +1185,16 @@ export class Employee extends EventEmitter {
 
   // A task turn that ended on an error no retry will fix (max turns, context full, unknown model, bad key): the task is
   // blocked with the error, instead of staying "doing" with an idle owner that nothing ever looks at again.
-  private blockTaskOnError(key: string | undefined, detail: string) {
+  private blockTaskOnError(key: string | undefined, detail: string, retryAt?: number) {
     const id = taskOf(key);
     const board = this.colleagues?.board();
     const k = id !== undefined ? board?.tasks.find((x) => x.id === id) : undefined;
     if (!board || !k || k.status !== "doing" || k.owner !== this.cfg.id) return;
+    if (retryAt && Number.isSafeInteger(retryAt) && /free_providers_(?:exhausted|cooling_down_or_unverified)/.test(detail)) {
+      board.setCoordination(k.id, { status: "blocked", error: "free_quota_exhausted", retryAt, by: "system", detail: "Waiting for a verified free provider cooldown to expire." });
+    } else if (/request_limit_before_tools/.test(detail)) {
+      board.setCoordination(k.id, { status: "blocked", error: "request_limit_before_tools", by: "system", detail: "Inference allowance exhausted before the proposed tools could run." });
+    }
     board.updateTask(k.id, { status: "blocked", note: `${t("server.board.sessionError")} ${clip(detail.replace(/\s+/g, " "), 300)}` }, "system");
   }
 
@@ -1203,16 +1232,22 @@ export class Employee extends EventEmitter {
     const controller = new AbortController();
     const taskId = taskOf(key);
     if (taskId !== undefined && this.freeTaskBudget?.id !== taskId) this.freeTaskBudget = { id: taskId, budget: createFreeAgentBudget() };
-    const budget = taskId !== undefined ? this.freeTaskBudget!.budget : createFreeAgentBudget();
+    const coordinated = taskId !== undefined ? this.colleagues?.board().tasks.find((x) => x.id === taskId)?.coordination : undefined;
+    const sharedBudget = taskId !== undefined && coordinated ? this.colleagues?.getCoordinationBudget(taskId)
+      : this.cfg.id === "alex" ? this.colleagues?.getActiveCoordinationBudget("alex") : undefined;
+    const budget = sharedBudget ?? (taskId !== undefined ? this.freeTaskBudget!.budget : createFreeAgentBudget());
     this.cx = { kill: () => controller.abort() };
     try {
       while (this.generation === gen && this.inbox.length && !this.sick) {
         const started = Date.now();
         const batch = this.inbox.splice(0);
         let detail: string | undefined;
+        let quotaRetryAt: number | undefined;
         try {
           if (batch.some(m => typeof m.message.content !== "string" || this.plain.get(m)?.files.length)) throw new FreeAgentError("attachments_not_supported");
           const task = taskId !== undefined ? this.colleagues?.board().tasks.find(t => t.id === taskId) : undefined;
+          const activeCoordinatorTask = taskId === undefined && this.cfg.id === "alex" ? this.colleagues?.board().tasks.find(t => t.coordination?.coordinator === "alex" && !["completed", "failed", "blocked", "cancelled"].includes(t.coordination.status)) : undefined;
+          const coordinationPhase = taskId !== undefined ? "execution" as const : activeCoordinatorTask?.coordination?.status === "review" ? "review" as const : "planning" as const;
           const previous = key === "side" ? undefined : taskId !== undefined ? task?.session : this.sessionId;
           const session = previous?.startsWith("free-agent:") ? previous : `free-agent:${crypto.randomUUID()}`;
           const histories = this.store.getMeta<Record<string, FreeMessage[]>>(this.cfg.id, "freeAgentHistory") ?? {};
@@ -1228,6 +1263,13 @@ export class Employee extends EventEmitter {
             cwd: this.cfg.cwd, model: this.cfg.model!, prompt: batch.map(plainText).join("\n\n"),
             system: this.cfg.systemPrompt, history: histories[session] ?? [], signal: controller.signal, onHistory: saveHistory,
             agentId: this.cfg.id, taskId, budget,
+            coordinationPhase,
+            coordination: this.colleagues ? freeAgentCoordination(this, this.colleagues, taskId) : undefined,
+            onBudget: current => this.colleagues?.persistCoordinationBudget(current),
+            onAttempt: attempt => {
+              if (taskId === undefined) return;
+              this.colleagues?.board().setCoordination(taskId, { by: "system", error: attempt.reason, lastAttempt: { agent: attempt.agent, requestId: attempt.requestId, requestsConsumed: attempt.requestsConsumed, tokensConsumed: attempt.tokensConsumed, reason: attempt.reason, proposedTools: attempt.proposedTools, at: attempt.at } });
+            },
             readOnly: !!this.meetingTurn || this.cfg.permissionMode === "plan",
             intel: (this.cfg.allowedTools ?? []).filter(isIntelTool),
             approve: async (tool, input, signal) => {
@@ -1236,7 +1278,10 @@ export class Employee extends EventEmitter {
               return decision.behavior === "allow";
             },
             onText: text => { if (this.generation === gen) { this.emit("chunk", text); this.emit("chunk_end"); this.push({ role: "assistant", text, ts: Date.now() }); } },
-            onTool: (name, file) => { if (this.generation === gen) this.push({ role: "activity", text: `${name}: ${file}`, kind: isIntelTool(name) ? "web" : name === "Read" ? "read" : "write", ts: Date.now() }); },
+            onTool: (name, file, metadata) => {
+              if (taskId !== undefined && metadata) this.colleagues?.board().recordCoordinationOperation(taskId, { agent: this.cfg.id, requestId: metadata.requestId, tool: name, ...(file ? { path: file } : {}), outcome: metadata.outcome, at: Date.now() });
+              if (this.generation === gen) this.push({ role: "activity", text: file ? `${name}: ${file}` : name, kind: isIntelTool(name) ? "web" : name === "Read" ? "read" : name === "Write" || name === "Edit" ? "write" : "other", ts: Date.now() });
+            },
             onUsage: u => {
               if (this.generation !== gen) return;
               this.model = u.model; this.context = u.input;
@@ -1245,10 +1290,13 @@ export class Employee extends EventEmitter {
             },
           });
           if (this.generation !== gen) return;
-        } catch (err) { detail = err instanceof FreeAgentError ? err.message : "free-agent: execution_failed"; }
+        } catch (err) {
+          detail = err instanceof FreeAgentError ? err.message : "free-agent: execution_failed";
+          if (err instanceof FreeAgentError) quotaRetryAt = err.retryAt;
+        }
         if (this.generation !== gen) return;
         const more = !detail && this.inbox.length > 0 && !controller.signal.aborted;
-        this.endTurn(detail, Date.now() - started, false, more);
+        this.endTurn(detail, Date.now() - started, false, more, quotaRetryAt);
         if (detail) break;
       }
     } finally {

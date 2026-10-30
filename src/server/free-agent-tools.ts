@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import { z } from "zod";
 
 export class FreeAgentError extends Error {
-  constructor(public readonly code: string) { super(`free-agent: ${code}`); }
+  constructor(public readonly code: string, public readonly retryAt?: number, public readonly attempt?: { agent: string; requestId: string; requestsConsumed: number; tokensConsumed: number; reason: string; proposedTools: string[]; executedTools: string[]; at: number }) { super(`free-agent: ${code}`); }
 }
 const MAX_FILE = 64 * 1024;
 const field = z.string().min(1).max(1024);
@@ -58,6 +58,23 @@ export class WorkspaceTools {
       if (text.includes("\0")) fail("text_only");
       return text;
     } finally { fs.closeSync(fd); }
+  }
+  /** Confirms an artifact is a regular in-workspace file that this execution actually read. */
+  verifyReadFile(name: string): boolean {
+    try {
+      const file = this.resolve(name);
+      const current = this.contents(file);
+      return current !== undefined && this.reads.get(file) === hash(current);
+    } catch { return false; }
+  }
+  /** Restore a read proof only when persisted tool output still exactly matches the current confined file. */
+  restoreReadProof(name: string, expectedContents: string): boolean {
+    try {
+      const file = this.resolve(name), current = this.contents(file);
+      if (current === undefined || current !== expectedContents) return false;
+      this.reads.set(file, hash(current));
+      return true;
+    } catch { return false; }
   }
   async execute(name: string, input: unknown, signal: AbortSignal,
     approve: (tool: FileTool, input: Record<string, unknown>) => Promise<boolean>, readOnly = false): Promise<string> {

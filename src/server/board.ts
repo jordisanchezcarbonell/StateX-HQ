@@ -4,6 +4,27 @@ import { isObject, readJsonSafe, writeJsonAtomicSync } from "./fsutil.js";
 
 export type TaskStatus = "todo" | "doing" | "review" | "done" | "blocked";
 export const TASK_STATUSES: readonly TaskStatus[] = ["todo", "doing", "review", "done", "blocked"];
+export type CoordinationStatus = "pending" | "assigned" | "running" | "review" | "completed" | "failed" | "blocked" | "cancelled";
+export interface CoordinationState {
+  coordinator: string;
+  worker: string;
+  status: CoordinationStatus;
+  criteria: string[];
+  result?: { summary: string; files: string[]; submittedAt: number };
+  error?: string;
+  retryAt?: number;
+  lastAttempt?: { agent: string; requestId: string; requestsConsumed: number; tokensConsumed: number; reason: string; proposedTools: string[]; at: number };
+  operations?: Array<{ agent: string; requestId: string; tool: string; path?: string; outcome: "executed" | "cached" | "failed" | "denied"; at: number }>;
+  recovery?: { authorizedBy: "user"; authorizedAt: number; previousLimit: number; newLimit: number; requestsAdded: number; used: number; reason: string };
+  verification?: { checkedAt: number; status: "passed" | "needs_manual_review" | "failed"; files: string[]; checks: Array<{ criterion: string; status: "passed" | "manual_review" | "failed"; file?: string }> };
+  manualReview?: { approvedBy: "user"; approvedAt: number; note: string; source: "local_verification" };
+  automaticCompletion?: { authorizedBy: "system"; mechanism: "structured_result_and_local_acceptance"; completedAt: number; resultSubmittedAt: number; verifiedAt: number };
+  reviewNotification?: { sentTo: string; sentAt: number };
+  phaseUsage?: { planning: number; execution: number; delivery: number; review: number; recovery: number };
+  phaseLimits?: { planning: number; execution: number; delivery: number; review: number; recovery: number };
+  history: Array<{ status: CoordinationStatus; at: number; by: string; detail?: string }>;
+  budget?: { used: number; tokens: number; toolCalls: number; limit: number; tokenLimit: number; toolLimit: number; phaseUsage?: CoordinationState["phaseUsage"]; phaseLimits?: CoordinationState["phaseLimits"]; recoveryLimit?: number; recoveryUsed?: number };
+}
 
 export interface Task {
   id: number;
@@ -20,6 +41,7 @@ export interface Task {
   autoStart?: string; // a start was approved (by this employee id or "user") while prerequisites were open: it begins by itself once they are done
   session?: string;   // the Claude session this task runs in, so a task sent back from review continues where it stopped
   kind?: "discovery"; // research only: looks, compares, proposes ideas; changes nothing in the project
+  coordination?: CoordinationState; // optional, backward-compatible metadata for a real delegated free-agent task
 }
 
 export interface Note {
@@ -227,6 +249,61 @@ export class Board extends EventEmitter {
     this.data.tasks.push(task);
     this.save();
     this.emit("added", task);
+    return task;
+  }
+
+  setCoordination(id: number, patch: Partial<Omit<CoordinationState, "history">> & { status?: CoordinationStatus; by: string; detail?: string }): Task | undefined {
+    const task = this.data.tasks.find((x) => x.id === id);
+    if (!task?.coordination) return undefined;
+    const current = task.coordination;
+    if (patch.status && patch.status !== current.status) current.history.push({ status: patch.status, at: Date.now(), by: patch.by, ...(patch.detail ? { detail: patch.detail.slice(0, 300) } : {}) });
+    if (patch.status) current.status = patch.status;
+    if (patch.criteria) current.criteria = patch.criteria.slice(0, 8);
+    if (patch.result !== undefined) current.result = patch.result;
+    if (Object.hasOwn(patch, "error")) { if (patch.error) current.error = patch.error.slice(0, 300); else delete current.error; }
+    if (Object.hasOwn(patch, "retryAt")) { if (Number.isSafeInteger(patch.retryAt) && patch.retryAt! > 0) current.retryAt = patch.retryAt; else delete current.retryAt; }
+    if (patch.budget) current.budget = patch.budget;
+    if (patch.lastAttempt) current.lastAttempt = { ...patch.lastAttempt, proposedTools: patch.lastAttempt.proposedTools.slice(0, 8) };
+    if (patch.operations) current.operations = patch.operations.slice(-100);
+    if (patch.recovery !== undefined) current.recovery = patch.recovery;
+    if (patch.verification !== undefined) current.verification = patch.verification;
+    if (patch.manualReview !== undefined) current.manualReview = patch.manualReview;
+    task.updated = Date.now();
+    this.save();
+    return task;
+  }
+
+  /** Persist coordinated completion and Board completion together, only after a structured result exists. */
+  completeCoordinationTask(id: number, by: string, detail: string, note: string, automaticCompletion?: CoordinationState["automaticCompletion"]): Task | undefined {
+    const task = this.data.tasks.find(x => x.id === id), state = task?.coordination;
+    if (!task || !state || state.status !== "review" || !state.result) return undefined;
+    const previous = task.status, now = Date.now();
+    state.history.push({ status: "completed", at: now, by, detail: detail.slice(0, 300) });
+    state.status = "completed";
+    delete state.error;
+    if (automaticCompletion) state.automaticCompletion = automaticCompletion;
+    task.status = "done";
+    task.notes.push({ ts: now, by, text: note.slice(0, 2000) });
+    task.updated = now;
+    this.save();
+    if (task.status !== previous) this.emit("status", task, previous, by);
+    return task;
+  }
+
+  recordCoordinationOperation(id: number, operation: NonNullable<CoordinationState["operations"]>[number]) {
+    const task = this.data.tasks.find((x) => x.id === id);
+    if (!task?.coordination) return;
+    const operations = [...(task.coordination.operations ?? []), { ...operation, path: operation.path?.slice(0, 512) }].slice(-100);
+    task.coordination.operations = operations;
+    this.save();
+  }
+
+  beginCoordination(id: number, input: { coordinator: string; worker: string; criteria: string[]; budget?: CoordinationState["budget"] }): Task | undefined {
+    const task = this.data.tasks.find((x) => x.id === id);
+    if (!task || task.coordination) return undefined;
+    const now = Date.now();
+    task.coordination = { coordinator: input.coordinator, worker: input.worker, status: "assigned", criteria: input.criteria.slice(0, 8), history: [{ status: "pending", at: now, by: input.coordinator }, { status: "assigned", at: now, by: input.coordinator }], ...(input.budget ? { budget: input.budget } : {}) };
+    this.save();
     return task;
   }
 

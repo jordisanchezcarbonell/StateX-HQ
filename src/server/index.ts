@@ -7,7 +7,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { Employee, listConnectors, IMAGE_TYPES, type EmployeeConfig, type ImageInput } from "./employee.js";
 import { Store } from "./store.js";
 import { Meeting } from "./meeting.js";
-import { Board, TASK_STATUSES, IDEA_STATUSES, type TaskStatus, type Task, type IdeaStatus, type Effort } from "./board.js";
+import { Board, TASK_STATUSES, IDEA_STATUSES, type TaskStatus, type Task, type IdeaStatus, type Effort, type CoordinationStatus } from "./board.js";
 import { expandHome, ensureWorktree, loadEmployees, loadEmployee, listSkills, listProjectSkills, writeAgentFile, createEmployeeDir, archiveEmployeeDir, writeSkill, readSkill, deleteSkill, syncClaudeAgents } from "./agents.js";
 import { loadSettings, ensureProjectIgnores, configPath, readRawConfig, writeRawConfig, officeDefFromRaw, officeIdOf, absPath, displayPath, rootFromEnv, initRoot, PKG_ROOT, THEMES, type OfficeDef, type Theme } from "./config.js";
 import { loadLocale, availableLocales, detectLocale, Translator } from "./i18n.js";
@@ -18,7 +18,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { officeToolDefs } from "./office-tools.js";
 import { initSkills, skillCatalog, viewOfSkill, skillById, previewSkill, installSkill, uninstallSkill, installedIds } from "./skills.js";
 import { CATEGORIES, initIntegrations, listIntegrations, saveIntegration, checkIntegration, removeIntegration, entryOf, startOAuth, finishOAuth, addCustom, gateway, setOwnClient } from "./integrations.js";
-import { freeOnly } from "./free-agent.js";
+import { createFreeAgentBudget, freeOnly, type FreeAgentBudget } from "./free-agent.js";
+import { WorkspaceTools } from "./free-agent-tools.js";
+import { freeModelRouter } from "./free-router.js";
+import { authorizeInferenceRecovery, cancelDelegatedTask, recoverDelegatedTasks, resumeQuotaBlockedTask } from "./free-agent-coordination.js";
+import { approveManualLocalReview, autoCompleteStructuredTask, referencedWorkspaceFiles, verifyLocalAcceptance } from "./free-agent-review.js";
 import { CLAUDE_MODELS, PROVIDERS, activeModels, isActiveModel, initProviders, providersReady, providerStatuses, updateProvider, installProvider, loginProvider, refreshProvider, canInstall, canLogin, type ProviderId } from "./providers.js";
 import { createGuard, isLoopbackHost } from "./security.js";
 import { acquireLock } from "./lock.js";
@@ -104,6 +108,7 @@ interface OfficeRt {
   openRuns: Map<number, OpenRun>;
   progress: Progress; // progress.json: XP per employee, office unlocks, daily badge
   layout: OfficeLayout; // layout.json: where the furniture stands (null = the classic layout)
+  coordinationBudgets: Map<number, FreeAgentBudget>;
 }
 const offices = new Map<string, OfficeRt>();
 
@@ -212,6 +217,21 @@ function storeFor(def: OfficeDef): Store {
 
 const colleaguesOf = (o: OfficeRt) => ({
   list: () => [...o.employees.values()], board: () => o.board, launch: (k: Task, from: Employee) => launch(o, k, from),
+  getCoordinationBudget: (taskId: number) => o.coordinationBudgets.get(taskId),
+  getActiveCoordinationBudget: (coordinator: string) => {
+    const task = o.board.tasks.find((x) => x.coordination?.coordinator === coordinator && !["completed", "failed", "blocked", "cancelled"].includes(x.coordination.status));
+    return task ? o.coordinationBudgets.get(task.id) : undefined;
+  },
+  setCoordinationBudget: (taskId: number, budget: FreeAgentBudget) => {
+    o.coordinationBudgets.set(taskId, budget);
+    o.board.setCoordination(taskId, { budget: { used: budget.used, tokens: budget.tokens, toolCalls: budget.toolCalls, limit: budget.limit, tokenLimit: budget.tokenLimit, toolLimit: budget.toolLimit, phaseUsage: budget.phaseUsage, phaseLimits: budget.phaseLimits, recoveryLimit: budget.recoveryLimit, recoveryUsed: budget.recoveryUsed }, by: "system" });
+  },
+  persistCoordinationBudget: (budget: FreeAgentBudget) => {
+    for (const [id, shared] of o.coordinationBudgets) if (shared === budget) {
+      const task = o.board.tasks.find(x => x.id === id), recovery = task?.coordination?.recovery;
+      o.board.setCoordination(id, { budget: { used: budget.used, tokens: budget.tokens, toolCalls: budget.toolCalls, limit: budget.limit, tokenLimit: budget.tokenLimit, toolLimit: budget.toolLimit, phaseUsage: budget.phaseUsage, phaseLimits: budget.phaseLimits, recoveryLimit: budget.recoveryLimit, recoveryUsed: budget.recoveryUsed }, ...(recovery ? { recovery: { ...recovery, used: budget.recoveryUsed ?? 0 } } : {}), by: "system" });
+    }
+  },
   capBlock: () => (capReached(o) ? capText(o) : undefined),
   discoveryBlock: () => {
     if (capReached(o)) return capText(o);
@@ -300,6 +320,7 @@ function advanceCycle(o: OfficeRt, event: { task?: Task; managerTurn?: boolean; 
 // A start that was approved (the Start button, or the project manager's start) goes through here. With open prerequisites the
 // approval is remembered on the task and it begins by itself when they are done; nothing starts that nobody approved.
 function launch(o: OfficeRt, k: Task, from?: Employee): "started" | "queued" | "waiting" {
+  if (k.coordination && k.coordination.status !== "assigned") return "waiting";
   const by = from?.cfg.id ?? "user";
   logEvent(o, { kind: "task_started", emp: k.owner, task: k.id, by, data: { by } });
   const owner = o.employees.get(k.owner);
@@ -311,6 +332,13 @@ function launch(o: OfficeRt, k: Task, from?: Employee): "started" | "queued" | "
 
 // What follows from a task changing state, without any model having to tell another one about it.
 function onTaskStatus(o: OfficeRt, k: Task, by: string) {
+  if (k.coordination && !["completed", "failed", "blocked", "cancelled"].includes(k.coordination.status)) {
+    const next = k.status === "doing" ? "running" : k.status === "review" ? "review" : k.status === "blocked" ? "blocked" : k.status === "done" ? "completed" : "assigned";
+    if (next === "completed" && !k.coordination.result) {
+      o.board.updateTask(k.id, { status: "blocked", note: "A delegated task cannot complete without a structured worker result." }, "system");
+      o.board.setCoordination(k.id, { status: "blocked", error: "structured_result_required", by: "system" });
+    } else if (k.coordination.status !== next) o.board.setCoordination(k.id, { status: next as CoordinationStatus, by });
+  }
   const owner = o.employees.get(k.owner);
   owner?.poke();
   advanceCycle(o, { task: k });
@@ -320,6 +348,7 @@ function onTaskStatus(o: OfficeRt, k: Task, by: string) {
   }
   const pm = managerOf(o);
   if (!pm || !owner || pm === owner || (by !== k.owner && by !== "system") || !["done", "review", "blocked"].includes(k.status)) return;
+  if (k.coordination?.error === "free_quota_exhausted") return;
   const note = k.notes[k.notes.length - 1]?.text.replace(/\s+/g, " ").slice(0, 400) ?? "";
   pm.addDigest(t("server.board.digestLine", { id: k.id, title: k.title, name: owner.cfg.name, status: k.status, note: note || "-" }));
   nudgeManager(o);
@@ -335,7 +364,7 @@ function managerNeeded(o: OfficeRt): boolean {
   if (capReached(o)) return false; // past the daily cap the office starts nothing by itself
   const open = o.board.tasks.filter((x) => x.status !== "done");
   const running = open.some((x) => taskRunning(o, x)); // approved and queued is as good as running; a "doing" nobody works on is not
-  const waiting = open.some((x) => x.status === "review" || x.status === "blocked");
+  const waiting = open.some((x) => x.status === "review" || (x.status === "blocked" && x.coordination?.error !== "free_quota_exhausted"));
   const unstarted = open.some((x) => x.status === "todo" && !x.autoStart && x.owner !== pm.cfg.id && !o.board.waitingOn(x).length);
   return mode === "auto" ? waiting || unstarted || (!running && pm.hasNews) : !running && (waiting || pm.hasNews);
 }
@@ -455,7 +484,15 @@ function openOffice(def: OfficeDef): OfficeRt {
     employees.set(cfg.id, new Employee(cfg, store));
   }
   const board = new Board(store.dir);
-  const o: OfficeRt = { def, store, employees, board, ledger: new Ledger(store.dir), events: new EventLog(store.dir), runs: new RunLog(store.dir), openRuns: new Map(), progress: new Progress(store.dir, board.tasks), layout: new OfficeLayout(store.dir) };
+  recoverDelegatedTasks(board);
+  const coordinationBudgets = new Map<number, FreeAgentBudget>();
+  for (const task of board.tasks) if (task.coordination?.budget && (! ["completed", "failed", "blocked", "cancelled"].includes(task.coordination.status) || (task.coordination.status === "blocked" && ((task.coordination.error === "free_quota_exhausted" && task.coordination.retryAt) || task.coordination.error === "request_limit_before_tools")))) {
+    const saved = task.coordination.budget, budget = createFreeAgentBudget();
+    budget.used = saved.used; budget.tokens = saved.tokens; budget.toolCalls = saved.toolCalls; budget.limit = Math.min(14, saved.limit); budget.tokenLimit = Math.min(budget.tokenLimit, saved.tokenLimit); budget.toolLimit = Math.min(budget.toolLimit, saved.toolLimit);
+    budget.phaseUsage = saved.phaseUsage; budget.phaseLimits = saved.phaseLimits; budget.recoveryLimit = saved.recoveryLimit; budget.recoveryUsed = saved.recoveryUsed;
+    coordinationBudgets.set(task.id, budget);
+  }
+  const o: OfficeRt = { def, store, employees, board, ledger: new Ledger(store.dir), events: new EventLog(store.dir), runs: new RunLog(store.dir), openRuns: new Map(), progress: new Progress(store.dir, board.tasks), layout: new OfficeLayout(store.dir), coordinationBudgets };
   offices.set(def.id, o);
   o.layout.ensure([...employees.keys()]); // a saved layout gets a desk for everybody (and remembers who sits where)
   board.on("change", safe("board change", () => broadcast({ type: "board", office: def.id, board: boardPayload(o) })));
@@ -855,12 +892,114 @@ r.post("/board/tasks/:id/start", (req: OReq, res) => {
   const owner = k && o?.employees.get(k.owner);
   if (!o || !k || !owner) return res.status(404).json({ error: t("server.notFound") });
   if (owner.inMeeting) return res.status(409).json({ error: t("server.board.inMeeting", { id: k.id, name: owner.cfg.name }) });
+  if (k.coordination?.status === "blocked" && k.coordination.error === "free_quota_exhausted") {
+    let available = false;
+    try { available = freeModelRouter().hasAvailableProvider(); } catch { /* state corruption fails closed */ }
+    const resumed = resumeQuotaBlockedTask(o.board, k.id, Date.now(), available);
+    if (resumed !== "resumed") return res.status(409).json({ error: resumed === "cooldown" ? "free_quota_cooldown" : resumed === "provider_unavailable" ? "no_verified_free_provider_available" : resumed === "budget_unavailable" ? "delegated_task_budget_unavailable" : resumed === "budget_exhausted" ? "delegated_task_budget_exhausted" : "task_not_resumable", retryAt: k.coordination.retryAt ?? null });
+    const savedBudget = k.coordination.budget, liveBudget = o.coordinationBudgets.get(k.id);
+    if (savedBudget && liveBudget) liveBudget.limit = savedBudget.limit;
+  }
   res.json({ ...k, launch: launch(o, k) });
+});
+r.post("/board/tasks/:id/recover", (req: OReq, res) => {
+  const o = officeOf(req), id = Number(req.params.id), task = o?.board.tasks.find(x => x.id === id);
+  if (!o || !task?.coordination) return res.status(404).json({ error: t("server.notFound") });
+  if (!req.get("origin") || !guard.originOk(req.get("origin"))) return res.status(403).json({ error: "user_origin_required" });
+  const result = authorizeInferenceRecovery(o.board, id, Date.now(), req.body?.confirm === true);
+  if (result !== "authorized") return res.status(409).json({ error: result });
+  const saved = task.coordination.budget, live = o.coordinationBudgets.get(id);
+  if (saved && live) { live.limit = saved.limit; live.recoveryLimit = 2; live.recoveryUsed = 0; live.phaseUsage = saved.phaseUsage; }
+  const started = launch(o, task, o.employees.get(task.coordination.coordinator));
+  res.json({ ...task, launch: started, recovery: task.coordination.recovery });
+});
+r.post("/board/tasks/:id/verify-local", async (req: OReq, res) => {
+  const o = officeOf(req), id = Number(req.params.id), task = o?.board.tasks.find(x => x.id === id), owner = task && o?.employees.get(task.owner);
+  if (!o || !task?.coordination || !owner) return res.status(404).json({ error: t("server.notFound") });
+  if (!["blocked", "review"].includes(task.coordination.status)) return res.status(409).json({ error: "delegated_task_not_ready_for_local_review" });
+  const workspace = new WorkspaceTools(owner.cfg.cwd), allowed = new Set([...referencedWorkspaceFiles(task.coordination.criteria), ...(task.coordination.result?.files ?? [])]);
+  const verification = await verifyLocalAcceptance(task.coordination.criteria, async file => {
+    if (!allowed.has(file)) return undefined;
+    const contents = await workspace.execute("Read", { file_path: file }, AbortSignal.timeout(3000), async () => false, true);
+    return contents.startsWith("Error:") ? undefined : contents;
+  }, Date.now(), task.coordination.result?.files ?? []);
+  o.board.setCoordination(id, { verification, by: "user", detail: `local verification: ${verification.status}` });
+  const finalization = task.coordination.result ? await autoCompleteStructuredTask(o.board, id, async file => {
+    if (!allowed.has(file)) return undefined;
+    const contents = await workspace.execute("Read", { file_path: file }, AbortSignal.timeout(3000), async () => false, true);
+    return contents.startsWith("Error:") ? undefined : contents;
+  }, owner.pendingAsks.length > 0) : undefined;
+  res.json({ ...verification, ...(finalization ? { finalization } : {}) });
+});
+r.post("/board/tasks/:id/approve-local-review", async (req: OReq, res) => {
+  const o = officeOf(req), id = Number(req.params.id), task = o?.board.tasks.find(x => x.id === id), owner = task && o?.employees.get(task.owner);
+  if (!o || !task?.coordination || !owner) return res.status(404).json({ error: t("server.notFound") });
+  if (!req.get("origin") || !guard.originOk(req.get("origin"))) return res.status(403).json({ error: "user_origin_required" });
+  const workspace = new WorkspaceTools(owner.cfg.cwd), allowed = new Set([...referencedWorkspaceFiles(task.coordination.criteria), ...(task.coordination.result?.files ?? [])]);
+  const verification = await verifyLocalAcceptance(task.coordination.criteria, async file => {
+    if (!allowed.has(file)) return undefined;
+    const contents = await workspace.execute("Read", { file_path: file }, AbortSignal.timeout(3000), async () => false, true);
+    return contents.startsWith("Error:") ? undefined : contents;
+  }, Date.now(), task.coordination.result?.files ?? []);
+  if (verification.status === "failed") return res.status(409).json({ error: "local_acceptance_failed", verification });
+  o.board.setCoordination(id, { verification, by: "system", detail: "acceptance re-read immediately before user review" });
+  const confirmed = Array.isArray(req.body?.manualCriteriaConfirmed) ? req.body.manualCriteriaConfirmed.filter(Number.isInteger) : [];
+  const approved = approveManualLocalReview(o.board, id, verification, confirmed, req.body?.confirm === true);
+  if (approved !== "approved") return res.status(409).json({ error: approved, verification });
+  res.json(o.board.tasks.find(x => x.id === id));
+});
+r.post("/board/tasks/:id/cancel", async (req: OReq, res) => {
+  const o = officeOf(req), id = Number(req.params.id), task = o?.board.tasks.find((x) => x.id === id);
+  if (!o || !task?.coordination) return res.status(404).json({ error: t("server.notFound") });
+  const owner = o.employees.get(task.owner);
+  const result = await cancelDelegatedTask(o.board, id, async () => owner?.cancelTask(id));
+  if (result === "terminal") return res.status(409).json({ error: "delegated_task_already_terminal" });
+  res.json(o.board.tasks.find((x) => x.id === id));
+});
+r.post("/board/tasks/:id/recover", (req: OReq, res) => {
+  const o = officeOf(req), id = Number(req.params.id), task = o?.board.tasks.find(x => x.id === id);
+  if (!o || !task?.coordination) return res.status(404).json({ error: t("server.notFound") });
+  const result = authorizeInferenceRecovery(o.board, id, Date.now(), req.body?.confirm === true);
+  if (result !== "authorized") return res.status(409).json({ error: result });
+  const saved = task.coordination.budget, live = o.coordinationBudgets.get(id);
+  if (saved && live) { live.limit = saved.limit; live.recoveryLimit = 2; live.recoveryUsed = 0; live.phaseUsage = saved.phaseUsage; }
+  const launched = launch(o, task, o.employees.get(task.coordination.coordinator));
+  res.json({ ...task, launch: launched, recovery: task.coordination.recovery });
+});
+r.post("/board/tasks/:id/verify-local", async (req: OReq, res) => {
+  const o = officeOf(req), id = Number(req.params.id), task = o?.board.tasks.find(x => x.id === id), owner = task && o?.employees.get(task.owner);
+  if (!o || !task?.coordination || !owner) return res.status(404).json({ error: t("server.notFound") });
+  if (!["blocked", "review"].includes(task.coordination.status)) return res.status(409).json({ error: "delegated_task_not_ready_for_local_review" });
+  const workspace = new WorkspaceTools(owner.cfg.cwd), allowedFiles = new Set([...referencedWorkspaceFiles(task.coordination.criteria), ...(task.coordination.result?.files ?? [])]);
+  const verification = await verifyLocalAcceptance(task.coordination.criteria, async file => {
+    if (!allowedFiles.has(file)) return undefined;
+    const contents = await workspace.execute("Read", { file_path: file }, AbortSignal.timeout(3000), async () => false, true);
+    return contents.startsWith("Error:") ? undefined : contents;
+  }, Date.now(), task.coordination.result?.files ?? []);
+  o.board.setCoordination(id, { verification, by: "user", detail: `local verification: ${verification.status}` });
+  res.json(verification);
+});
+r.post("/board/tasks/:id/approve-local-review", async (req: OReq, res) => {
+  const o = officeOf(req), id = Number(req.params.id), task = o?.board.tasks.find(x => x.id === id), owner = task && o?.employees.get(task.owner);
+  if (!o || !task?.coordination || !owner) return res.status(404).json({ error: t("server.notFound") });
+  const workspace = new WorkspaceTools(owner.cfg.cwd), allowedFiles = new Set([...referencedWorkspaceFiles(task.coordination.criteria), ...(task.coordination.result?.files ?? [])]);
+  const verification = await verifyLocalAcceptance(task.coordination.criteria, async file => {
+    if (!allowedFiles.has(file)) return undefined;
+    const contents = await workspace.execute("Read", { file_path: file }, AbortSignal.timeout(3000), async () => false, true);
+    return contents.startsWith("Error:") ? undefined : contents;
+  }, Date.now(), task.coordination.result?.files ?? []);
+  if (verification.status === "failed") return res.status(409).json({ error: "local_acceptance_failed", verification });
+  o.board.setCoordination(id, { verification, by: "system", detail: "acceptance re-read immediately before user review" });
+  const confirmed = Array.isArray(req.body?.manualCriteriaConfirmed) ? req.body.manualCriteriaConfirmed.filter(Number.isInteger) : [];
+  const approved = approveManualLocalReview(o.board, id, verification, confirmed, req.body?.confirm === true);
+  if (approved !== "approved") return res.status(409).json({ error: approved, verification });
+  res.json(o.board.tasks.find(x => x.id === id));
 });
 r.put("/board/tasks/:id", (req: OReq, res) => {
   const o = officeOf(req), b = req.body ?? {};
   const cur = o?.board.tasks.find((x) => x.id === Number(req.params.id));
   if (!o || !cur) return res.status(404).json({ error: t("server.notFound") });
+  if (cur.coordination && b.status === "done" && cur.coordination.status !== "completed") return res.status(409).json({ error: "delegated_task_requires_verified_completion" });
   const owner = b.owner !== undefined ? o.employees.get(String(b.owner)) : undefined;
   if (b.owner !== undefined && !owner) return res.status(400).json({ error: t("server.board.taskFields") });
   // a running task keeps its owner: its session, turn and queue belong to them

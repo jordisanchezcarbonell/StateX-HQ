@@ -140,6 +140,15 @@ try {
     assert.deepEqual(requests[0].messages.slice(1,-1),history);assert.equal(requests[0].max_tokens,1024);assert.equal(requests[0].model,'auto');
     assert(!('provider' in requests[0]));assert.deepEqual(requests[0].tools.map(t=>t.function.name),['Read','Write','Edit']);
   });
+  await test('delegated runtime prompt removes stale generic no-delegation instruction and lists only enabled coordination',async()=>{
+    mockFetch([response()]);
+    const coordination={tools:[{type:'function',function:{name:'delegate_task',description:'delegate to Mia',parameters:{type:'object'}}}],execute:async()=>''};
+    await runFreeAgent(options({system:'Alex at StateX. Do not use shell commands, network access, delegation, or other workspaces.',coordination}));
+    const system=requests[0].messages[0].content;
+    assert.doesNotMatch(system,/Do not use shell commands, network access, delegation/);
+    assert.match(system,/Alex coordinates Mia/);assert.match(system,/listed coordination tools only/);
+    assert.deepEqual(requests[0].tools.map(t=>t.function.name),['Read','Write','Edit','delegate_task']);
+  });
   await test('bounded Read → approved Edit → Read cycle completes within four inferences',async()=>{
     fs.writeFileSync(readme,'# Before\n');const asks=[],used=[];
     mockFetch([
@@ -176,16 +185,47 @@ try {
       response(tool('Read',{file_path:'README.md'},'dedupe-reread')),
       response({role:'assistant',content:'Verified.'}),
     ]);
-    await runFreeAgent(options({approve:async()=>{asks.push('approved');return true;},onTool:name=>used.push(name)}));
-    assert.equal(asks.length,1);assert.deepEqual(used,['Read','Edit','Read']);assert.equal(requests.length,4);assert.equal(fs.readFileSync(readme,'utf8'),'# After\n');
+    await runFreeAgent(options({approve:async()=>{asks.push('approved');return true;},onTool:(name,_file,meta)=>used.push([name,meta.outcome])}));
+    assert.equal(asks.length,1);assert.deepEqual(used,[['Read','executed'],['Edit','executed'],['Edit','cached'],['Read','executed']]);assert.equal(requests.length,4);assert.equal(fs.readFileSync(readme,'utf8'),'# After\n');
     const toolMessages=requests[2].messages.filter(m=>m.role==='tool');assert.deepEqual(toolMessages.map(m=>m.tool_call_id),['dedupe-read','edit-once','edit-again']);
+  });
+  await test('a quota failure after an approved write resumes from history without repeating the write',async()=>{
+    const target=path.join(ws,'quota-resume.txt');assert(!fs.existsSync(target));
+    let savedHistory;const approvals=[];
+    mockFetch([
+      response(tool('Write',{file_path:'quota-resume.txt',content:'write once'},'quota-write')),
+      ()=>Response.json({error:{code:'free_providers_exhausted'}},{status:503}),
+    ]);
+    await assert.rejects(runFreeAgent(options({onHistory:h=>{savedHistory=h;},approve:async()=>{approvals.push('Write');return true;}})),/gateway_http_503:free_providers_exhausted/);
+    assert.equal(fs.readFileSync(target,'utf8'),'write once');assert.equal(approvals.length,1);
+    mockFetch([
+      response(tool('Write',{file_path:'quota-resume.txt',content:'write once'},'quota-write-replayed')),
+      response(tool('Read',{file_path:'quota-resume.txt'},'quota-read-back')),
+      response({role:'assistant',content:'Verified the existing file.'}),
+    ]);
+    const events=[];await runFreeAgent(options({history:savedHistory,prompt:'Continue after quota reset.',approve:async()=>{approvals.push('unexpected');return true;},onTool:(n,_file,meta)=>events.push([n,meta.outcome])}));
+    assert.equal(fs.readFileSync(target,'utf8'),'write once');assert.deepEqual(approvals,['Write']);assert.deepEqual(events,[['Write','cached'],['Read','executed']]);
+    assert(requests[1].messages.some(m=>m.role==='tool'&&m.tool_call_id==='quota-write-replayed'&&m.content.startsWith('OK: file written')));
   });
   await test('configured legacy request cap can tighten the run to two inferences',async()=>{
     const previous=process.env.STATEX_FREE_MAX_REQUESTS;process.env.STATEX_FREE_MAX_REQUESTS='2';
     try {
       mockFetch(Array.from({length:5},(_,i)=>response(tool('Read',{file_path:'README.md'},`cap-${i}`))));
-      await assert.rejects(runFreeAgent(options()),/request_limit_before_tools/);assert.equal(requests.length,2);
+      let attempt;await assert.rejects(runFreeAgent(options({onAttempt:x=>{attempt=x;}})),/request_limit_before_tools/);assert.equal(requests.length,2);
+      assert.equal(attempt.reason,'request_limit_before_tools');assert.deepEqual(attempt.proposedTools,['Read']);assert.deepEqual(attempt.executedTools,['Read']);
+      assert.equal(JSON.stringify(attempt).includes('file_path'),false);
     } finally { if(previous===undefined)delete process.env.STATEX_FREE_MAX_REQUESTS;else process.env.STATEX_FREE_MAX_REQUESTS=previous; }
+  });
+  await test('a terminal structured result can close at the hard inference cap; nonterminal proposed tools remain unexecuted',async()=>{
+    const budget=createFreeAgentBudget();budget.used=1;budget.limit=2;budget.recoveryLimit=1;budget.recoveryUsed=0;
+    let submitted=0;const coordination={tools:[{type:'function',function:{name:'submit_task_result',description:'submit verified result',parameters:{type:'object'}}}],execute:async name=>{assert.equal(name,'submit_task_result');submitted++;return 'Result submitted for review on task #9.';}};
+    mockFetch([response(tool('submit_task_result',{summary:'Verified prior read.',files:['README.md']},'final-submit'))]);
+    await runFreeAgent(options({budget,taskId:9,agentId:'mia',coordination,coordinationPhase:'execution'}));
+    assert.equal(submitted,1);assert.equal(budget.used,2);assert.equal(requests.length,1);
+    const noBudget=createFreeAgentBudget();noBudget.used=0;noBudget.limit=1;const target=path.join(ws,'must-not-write-on-last-turn.txt');let attempted;
+    mockFetch([response(tool('Write',{file_path:'must-not-write-on-last-turn.txt',content:'blocked'},'last-write'))]);
+    await assert.rejects(runFreeAgent(options({budget:noBudget,approve:allow,onAttempt:x=>{attempted=x;}})),/request_limit_before_tools/);
+    assert(!fs.existsSync(target));assert.deepEqual(attempted.proposedTools,['Write']);assert.deepEqual(attempted.executedTools,[]);
   });
   await test('one task budget is shared across queued agent batches and cannot silently reset',async()=>{
     const previous=process.env.STATEX_FREE_MAX_ITERATIONS;process.env.STATEX_FREE_MAX_ITERATIONS='2';

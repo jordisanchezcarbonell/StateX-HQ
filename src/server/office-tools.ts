@@ -5,6 +5,7 @@ import { slug } from "./agents.js";
 import fs from "node:fs";
 import { writeFileAtomicSync } from "./fsutil.js";
 import { t } from "./runtime.js";
+import type { FreeAgentBudget } from "./free-agent.js";
 
 export interface Colleagues {
   list(): Employee[];
@@ -16,6 +17,10 @@ export interface Colleagues {
   autoMoveBlock(): string | undefined;
   countDiscovery(): void;
   capBlock(): string | undefined; // past the office's daily cap: nothing is started by anyone but the boss
+  getCoordinationBudget(taskId: number): FreeAgentBudget | undefined;
+  getActiveCoordinationBudget(coordinator: string): FreeAgentBudget | undefined;
+  setCoordinationBudget(taskId: number, budget: FreeAgentBudget): void;
+  persistCoordinationBudget(budget: FreeAgentBudget): void;
   gatewayUrl(self: Employee, id: string): string; // where an employee's session reaches an integration (the gateway adds the credentials)
   mcpUrl(self: Employee): string; // where an engine that is a separate program reaches this employee's office tools
 }

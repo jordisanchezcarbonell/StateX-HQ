@@ -33,7 +33,7 @@
     "mvp:free": "node scripts/prepare-statex-mvp.mjs --free",
     "mvp:prepare": "node scripts/prepare-statex-mvp.mjs",
     "test:ui": "node scripts/test-statex-ui.mjs",
-    "test": "npm run build && node scripts/test-retry.mjs && node scripts/test-archive.mjs && node scripts/test-digest.mjs && node scripts/test-progress.mjs && node scripts/test-layout.mjs && node scripts/test-market.mjs && node scripts/test-integrations.mjs && node scripts/test-skills.mjs && node scripts/test-statex-mvp.mjs && node scripts/test-free-agent.mjs && node scripts/test-free-router.mjs && node scripts/test-statex-free-launcher.mjs && node scripts/test-free-intel.mjs && node scripts/test-statex-cyber.mjs"
+    "test": "npm run build && node scripts/test-retry.mjs && node scripts/test-archive.mjs && node scripts/test-digest.mjs && node scripts/test-progress.mjs && node scripts/test-layout.mjs && node scripts/test-market.mjs && node scripts/test-integrations.mjs && node scripts/test-skills.mjs && node scripts/test-statex-mvp.mjs && node scripts/test-free-agent.mjs && node scripts/test-multi-agent.mjs && node scripts/test-free-router.mjs && node scripts/test-statex-free-launcher.mjs && node scripts/test-free-intel.mjs && node scripts/test-statex-cyber.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.283",
