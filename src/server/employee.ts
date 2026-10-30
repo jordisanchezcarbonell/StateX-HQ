@@ -19,7 +19,7 @@ import { runCodexTurn, skillsIndex, skillFile, type CodexItem } from "./codex.js
 import { runGeminiTurn, type GeminiEvent } from "./gemini.js";
 import { costOf } from "./prices.js";
 import { statusDigest } from "./digest.js";
-import { runFreeAgent, freeOnly, type FreeMessage } from "./free-agent.js";
+import { runFreeAgent, createFreeAgentBudget, freeOnly, type FreeAgentBudget, type FreeMessage } from "./free-agent.js";
 import { isIntelTool } from "./free-agent-intel.js";
 import { FreeAgentError } from "./free-agent-tools.js";
 import { engineOf, providerEnabled, geminiKey, openrouterCatalog, openrouterCostOf, openrouterEnv, openrouterSlug, markAuthFailed, AUTH_ERROR, type Engine } from "./providers.js";
@@ -231,6 +231,7 @@ export class Employee extends EventEmitter {
   private procFirst = true;
   private turnSpend?: { cost: number; tokens?: Spend["tokens"] };
   private taskId?: number; // the board task being worked on, in a clean session of its own
+  private freeTaskBudget?: { id: number; budget: FreeAgentBudget };
   private taskQueue: Array<{ id: number; from?: Employee }> = [];
   private taskNotesSeen = new Map<number, number>(); // task id -> how many notes it had when this employee last began it
   private taskTalk: string[] = [];  // what the boss said inside the task session, and the answers: handed to the chat when the task ends
@@ -469,6 +470,7 @@ export class Employee extends EventEmitter {
     const k = board?.tasks.find((x) => x.id === id);
     if (!board || !k || k.status === "done" || k.owner !== this.cfg.id) return false;
     this.taskId = id;
+    if (this.freeTaskBudget?.id !== id) this.freeTaskBudget = undefined;
     if (this.taskTalkFor !== id) { this.taskTalk = []; this.taskTalkFor = id; }
     this.setStatus("working"); // before the board hears about it: its listeners must find this employee busy
     const back = k.session ? this.sendBackNote(k) : undefined; // sent back (e.g. from review): same session, plus what was said
@@ -519,6 +521,7 @@ export class Employee extends EventEmitter {
     if (k && k.status === "doing" && k.owner === this.cfg.id) return false;
     const id = this.taskId;
     this.taskId = undefined;
+    if (this.freeTaskBudget?.id === id) this.freeTaskBudget = undefined;
     this.forgetRetry(`task:${id}`);
     this.handBack(id);
     this.stopQuery();
@@ -530,6 +533,7 @@ export class Employee extends EventEmitter {
     const id = this.taskId;
     if (id === undefined) return;
     this.taskId = undefined;
+    if (this.freeTaskBudget?.id === id) this.freeTaskBudget = undefined;
     this.forgetRetry(`task:${id}`);
     this.stopQuery();
     if (mode === "requeue") {
@@ -791,6 +795,7 @@ export class Employee extends EventEmitter {
     this.history = [];
     this.unanswered = [];
     this.taskId = undefined;
+    this.freeTaskBudget = undefined;
     this.taskQueue = [];
     this.taskTalk = [];
     this.taskTalkFor = undefined;
@@ -1196,6 +1201,9 @@ export class Employee extends EventEmitter {
   // ---- Free Agent: one bounded OpenAI tool loop, no CLI / SDK / office MCP ----
   private async runFree(gen: number, key: string) {
     const controller = new AbortController();
+    const taskId = taskOf(key);
+    if (taskId !== undefined && this.freeTaskBudget?.id !== taskId) this.freeTaskBudget = { id: taskId, budget: createFreeAgentBudget() };
+    const budget = taskId !== undefined ? this.freeTaskBudget!.budget : createFreeAgentBudget();
     this.cx = { kill: () => controller.abort() };
     try {
       while (this.generation === gen && this.inbox.length && !this.sick) {
@@ -1204,7 +1212,6 @@ export class Employee extends EventEmitter {
         let detail: string | undefined;
         try {
           if (batch.some(m => typeof m.message.content !== "string" || this.plain.get(m)?.files.length)) throw new FreeAgentError("attachments_not_supported");
-          const taskId = taskOf(key);
           const task = taskId !== undefined ? this.colleagues?.board().tasks.find(t => t.id === taskId) : undefined;
           const previous = key === "side" ? undefined : taskId !== undefined ? task?.session : this.sessionId;
           const session = previous?.startsWith("free-agent:") ? previous : `free-agent:${crypto.randomUUID()}`;
@@ -1220,6 +1227,7 @@ export class Employee extends EventEmitter {
           await runFreeAgent({
             cwd: this.cfg.cwd, model: this.cfg.model!, prompt: batch.map(plainText).join("\n\n"),
             system: this.cfg.systemPrompt, history: histories[session] ?? [], signal: controller.signal, onHistory: saveHistory,
+            agentId: this.cfg.id, taskId, budget,
             readOnly: !!this.meetingTurn || this.cfg.permissionMode === "plan",
             intel: (this.cfg.allowedTools ?? []).filter(isIntelTool),
             approve: async (tool, input, signal) => {

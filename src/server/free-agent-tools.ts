@@ -16,7 +16,7 @@ const schemas = {
 };
 export type FileTool = keyof typeof schemas;
 export const FREE_TOOLS = Object.entries(schemas).map(([name, schema]) => ({
-  type: "function", function: { name, description: name === "Read" ? "Read a UTF-8 workspace file using a relative path." : name === "Edit" ? "Replace exactly one occurrence in a previously read file. Requires user approval." : "Write a UTF-8 file. Existing files must be read first. Requires user approval.", parameters: z.toJSONSchema(schema) },
+  type: "function", function: { name, description: name === "Read" ? "Read a UTF-8 workspace file using a relative path." : name === "Edit" ? "Replace exactly one occurrence in the current contents of a previously read file. After any successful mutation, read the file again before another mutation. Requires user approval." : "Write a UTF-8 file using a relative path. Read existing files first; after any successful mutation, read the file again before another mutation. Requires user approval.", parameters: z.toJSONSchema(schema) },
 }));
 const blocked = (part: string) => /^(\.git|\.claude|\.pixel-office|\.ssh|\.aws|\.codex|node_modules|\.env(?:\..*)?|secrets(?:\..*)?|credentials(?:\..*)?)$/i.test(part);
 function fail(code: string): never { throw new FreeAgentError(code); }

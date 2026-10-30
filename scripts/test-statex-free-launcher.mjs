@@ -57,25 +57,25 @@ function manualRouter(h) {
 try {
   await test('occupied router port with a non-StateX service aborts without killing it',async()=>{
     const h=harness('foreign-router');h.foreign.set(h.ports.router,{type:'router',good:false});
-    await assert.rejects(startFree({repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office},h.deps),/health did not match policy free-only/);
+    await assert.rejects(startFree({repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'},h.deps),/health did not match policy free-only/);
     assert.equal(h.signals.length,0);assert.equal(h.live.size,0);
   });
   await test('occupied office port with another process aborts before starting the router',async()=>{
     const h=harness('foreign-office');h.foreign.set(h.ports.office,{type:'alien'});
-    await assert.rejects(startFree({repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office},h.deps),/different office or process/);
+    await assert.rejects(startFree({repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'},h.deps),/different office or process/);
     assert.equal(h.live.size,0);assert.equal(h.signals.length,0);assert(!fs.existsSync(h.officeDir));
   });
   await test('existing verified services are reused and stop leaves them running',async()=>{
     const h=harness('reuse');preparePersistentOffice(h.officeDir,h.ports.office);
     const customProfile=path.join(h.officeDir,'.pixel-office','employees','mia','agent.md');fs.writeFileSync(customProfile,'preserve while reusing');
     manualRouter(h);h.live.set(h.ports.office,{type:'office',good:true});
-    const ctx=await startFree({repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office},h.deps);
+    const ctx=await startFree({repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'},h.deps);
     assert(ctx.routerListening&&ctx.officeListening);assert.equal(ctx.owned.length,0);assert.equal(fs.readFileSync(customProfile,'utf8'),'preserve while reusing');
     const result=await stopFree({repoRoot:h.root,paths:h.paths,officeDir:h.officeDir},h.deps);
     assert.deepEqual(result.stopped,[]);assert.equal(h.live.size,2);assert.equal(h.signals.length,0);
   });
   await test('regression PID 62920: macOS Python.app argv from run.sh is verified and reused; stop leaves manual gateway running',async()=>{
-    const h=harness('manual-router'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office};
+    const h=harness('manual-router'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'};
     manualRouter(h);
     const ctx=await startFree(opts,h.deps);
     assert(ctx.routerListening&&!ctx.officeListening);assert.deepEqual(ctx.owned.map(x=>x.kind),['office']);
@@ -83,14 +83,22 @@ try {
     assert.deepEqual(result.stopped,['office']);assert.equal(h.live.has(h.ports.router),true);
     assert.equal(h.signals.some(([pid])=>pid===62920),false);
   });
+  await test('default TypeScript backend ignores 4141 and starts only the office without provider requests',async()=>{
+    const h=harness('typescript-default'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'typescript'};
+    h.foreign.set(h.ports.router,{type:'foreign'});
+    const ctx=await startFree(opts,h.deps);
+    assert.equal(ctx.routerListening,false);assert.equal(h.live.has(h.ports.office),true);assert.equal(h.foreign.has(h.ports.router),true);
+    assert.deepEqual(ctx.owned.map(x=>x.kind),['office']);
+    await stopFree(opts,h.deps);assert.equal(h.foreign.has(h.ports.router),true);assert.equal(h.signals.length,1);
+  });
   await test('free-only health without verifiable listener identity is left running with manual inspection steps',async()=>{
-    const h=harness('unverified-router'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office};
+    const h=harness('unverified-router'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'};
     h.live.set(h.ports.router,{type:'router',good:true});
     await assert.rejects(startFree(opts,h.deps),/lsof\/ps.*Ctrl\+C.*stop:free will not stop this service/);
     assert.equal(h.signals.length,0);assert.equal(h.live.has(h.ports.router),true);assert(!fs.existsSync(h.officeDir));
   });
   await test('launched router with unverifiable identity is not signalled and reports safe manual handling',async()=>{
-    const h=harness('unverifiable-launched-router'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office};
+    const h=harness('unverifiable-launched-router'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'};
     const spawn=h.deps.spawn;
     h.deps.spawn=(...args)=>{const child=spawn(...args);const entry=h.proc.get(child.pid);if(entry.kind==='router')entry.identity={...entry.identity,cwd:path.join(h.root,'other-dir')};return child;};
     await assert.rejects(startFree(opts,h.deps),/Could not verify the router process identity.*Ctrl\+C.*lsof.*stop:free will not stop this service/);
@@ -98,7 +106,7 @@ try {
     assert.match(h.errors.join('\n'),/was left running because its identity was not recorded/);
   });
   await test('waits through run.sh exec and listener startup race before recording router identity',async()=>{
-    const h=harness('startup-race'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office};
+    const h=harness('startup-race'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'};
     const identity=h.deps.identity,portListening=h.deps.portListening;let identityReads=0,routerProbes=0;
     h.deps.identity=pid=>{
       const value=identity(pid);
@@ -115,7 +123,7 @@ try {
     await stopFree(opts,h.deps);
   });
   await test('starts gateway and isolated office, then stop only signals verified owned PIDs',async()=>{
-    const h=harness('start-stop'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office};
+    const h=harness('start-stop'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'};
     const ctx=await startFree(opts,h.deps);
     assert.deepEqual(ctx.owned.map(x=>x.kind).sort(),['office','router']);assert.equal(h.live.size,2);assert.equal(h.builds,0);
     const state=JSON.parse(fs.readFileSync(h.paths.stateFile,'utf8'));assert.deepEqual(Object.keys(state.processes).sort(),['office','router']);
@@ -126,14 +134,14 @@ try {
     const stopped=await stopFree(opts,h.deps);assert.deepEqual(stopped.stopped.sort(),['office','router']);assert.equal(h.live.size,0);assert(!fs.existsSync(h.paths.stateFile));assert.equal(fs.readFileSync(marker,'utf8'),'preserve me');
   });
   await test('restart reuses persistent files without overwriting user data',async()=>{
-    const h=harness('restart'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office};
+    const h=harness('restart'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'};
     await startFree(opts,h.deps);const profile=path.join(h.officeDir,'.pixel-office','employees','mia','agent.md');fs.writeFileSync(profile,'custom Mia profile');
     await stopFree(opts,h.deps);await startFree(opts,h.deps);
     assert.equal(fs.readFileSync(profile,'utf8'),'custom Mia profile');assert.equal(h.live.size,2);
     await stopFree(opts,h.deps);
   });
   await test('PID reuse or changed process identity is never signalled',async()=>{
-    const h=harness('pid-reuse'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office};
+    const h=harness('pid-reuse'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'};
     await startFree(opts,h.deps);const state=JSON.parse(fs.readFileSync(h.paths.stateFile,'utf8'));
     h.proc.get(state.processes.router.pid).identity={started:'later-process',fingerprint:'different',command:'unrelated process'};
     const result=await stopFree(opts,h.deps);
@@ -141,7 +149,7 @@ try {
     assert(h.live.has(h.ports.router));
   });
   await test('startup refuses a workspace with work Pixel Office could auto-resume',async()=>{
-    const h=harness('pending-work'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office};
+    const h=harness('pending-work'),opts={repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python'};
     preparePersistentOffice(h.officeDir,h.ports.office);
     const boardDir=path.join(h.officeDir,'.pixel-office','data','main');fs.mkdirSync(boardDir,{recursive:true});
     fs.writeFileSync(path.join(boardDir,'board.json'),JSON.stringify({tasks:[{status:'doing'}]}));
@@ -149,7 +157,7 @@ try {
   });
   await test('an already-cancelled start creates no office files',async()=>{
     const h=harness('cancel-start'),controller=new AbortController();controller.abort();
-    await assert.rejects(startFree({repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,signal:controller.signal},h.deps),/Startup interrupted/);
+    await assert.rejects(startFree({repoRoot:h.root,paths:h.paths,officeDir:h.officeDir,routerPort:h.ports.router,officePort:h.ports.office,backend:'python',signal:controller.signal},h.deps),/Startup interrupted/);
     assert(!fs.existsSync(h.paths.stateDir));assert.equal(h.live.size,0);
   });
   console.log(`StateX Free launcher: ${passed} passed, 0 failed, providerRequests=0`);

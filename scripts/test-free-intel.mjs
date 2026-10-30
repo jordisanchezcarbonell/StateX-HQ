@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+process.env.STATEX_FREE_ROUTER_BACKEND='python';
 const {IntelTools,normalizeDomain,checkScope,loadScope,intelToolDefs,INTEL_TOOL_NAMES,INTEL_HOSTS}=await import('../dist/server/free-agent-intel.js');
 const {WorkspaceTools}=await import('../dist/server/free-agent-tools.js');
 const {runFreeAgent,gatewayBase}=await import('../dist/server/free-agent.js');

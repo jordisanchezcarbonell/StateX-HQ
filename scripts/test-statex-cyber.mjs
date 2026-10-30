@@ -6,6 +6,7 @@ import path from 'node:path';
 const {preparePersistentOffice}=await import('./statex-free-launcher.mjs');
 const {prepareCyberTeam,CYBER_TEAM}=await import('./prepare-statex-cyber.mjs');
 const {parseAgentFile}=await import('../dist/server/agents.js');
+const {engineOf}=await import('../dist/server/providers.js');
 const {isIntelTool}=await import('../dist/server/free-agent-intel.js');
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'statex-cyber-'));
 try{
@@ -22,9 +23,15 @@ try{
   }
   assert(!fs.existsSync(path.join(office,'scope.json')),'never creates a real scope');
   assert(fs.existsSync(path.join(office,'scope.example.json')));
+  const roster=['alex','mia','sam','iker','lia','nora','teo','vera'];
+  for(const id of roster){
+    const {meta}=parseAgentFile(path.join(r.employeesDir,id,'agent.md'));
+    assert.equal(meta.model,'free-agent:auto',`${id} configured for StateX Free Agent`);
+    assert.equal(engineOf(meta.model),'free-agent',`${id} resolves through the shared runtime`);
+  }
   fs.writeFileSync(path.join(r.employeesDir,'nora','agent.md'),'custom');
   const again=prepareCyberTeam(office);
   assert.equal(again.created.length,0);assert.equal(fs.readFileSync(path.join(r.employeesDir,'nora','agent.md'),'utf8'),'custom');
   for(const id of ['mia','alex','sam'])assert(fs.existsSync(path.join(r.employeesDir,id,'agent.md')),'original team kept');
-  console.log('StateX cyber team: 5 profiles, intel tools only by grant, no scope.json created, idempotent');
+  console.log('StateX cyber team: 8 employees use free-agent; intel tools stay profile-granted; no scope.json created; idempotent');
 }finally{fs.rmSync(dir,{recursive:true,force:true});}

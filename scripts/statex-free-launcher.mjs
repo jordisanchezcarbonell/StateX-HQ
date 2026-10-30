@@ -8,7 +8,7 @@ import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const SAFE_ENV_KEYS = ['PATH','HOME','USER','LOGNAME','TMPDIR','TEMP','TMP','LANG','LC_ALL','LC_CTYPE','SYSTEMROOT','WINDIR','STATEX_FREE_ROUTER_URL','STATEX_FREE_MAX_REQUESTS','STATEX_FREE_MAX_OUTPUT_TOKENS'];
+const SAFE_ENV_KEYS = ['PATH','HOME','USER','LOGNAME','TMPDIR','TEMP','TMP','LANG','LC_ALL','LC_CTYPE','SYSTEMROOT','WINDIR','STATEX_FREE_ROUTER_URL','STATEX_FREE_MAX_REQUESTS','STATEX_FREE_MAX_ITERATIONS','STATEX_FREE_MAX_OUTPUT_TOKENS','STATEX_FREE_MAX_TOTAL_TOKENS','STATEX_FREE_MAX_TOOLS','STATEX_FREE_ROUTER_BACKEND','STATEX_FREE_ROUTER_STATE','STATEX_FREE_ATTESTATION_FILE','GROQ_API_KEY','OPENROUTER_API_KEY'];
 const HEALTH_PATH = '/health';
 
 export const launcherPaths = (root = repoRoot) => {
@@ -254,8 +254,8 @@ function startGatewayProcess(root,port,deps) {
   const env=safeEnv({SERVER_HOST:'127.0.0.1',SERVER_PORT:String(port)});
   return deps.spawn('bash',[path.join(routerDir,'run.sh')],{cwd:routerDir,env,detached:true,stdio:'inherit'});
 }
-function startOfficeProcess(root,officeDir,port,deps) {
-  const env=safeEnv({STATEX_FREE_ONLY:'1',PIXEL_OFFICE_MODE:'project',PIXEL_OFFICE_ROOT:officeDir,PORT:String(port),PIXEL_OFFICE_OPEN:'0'});
+function startOfficeProcess(root,officeDir,port,deps,backend='typescript') {
+  const env=safeEnv({STATEX_FREE_ONLY:'1',STATEX_FREE_ROUTER_BACKEND:backend==='legacy'?'python':backend,PIXEL_OFFICE_MODE:'project',PIXEL_OFFICE_ROOT:officeDir,PORT:String(port),PIXEL_OFFICE_OPEN:'0'});
   return deps.spawn(process.execPath,[path.join(root,'scripts','free-office-child.mjs'),officeDir,String(port)],{cwd:root,env,detached:true,stdio:'inherit'});
 }
 async function waitForReady(kind,port,officeDir,deps,signal,timeout=15000) {
@@ -301,13 +301,16 @@ export async function stopFree(options={},providedDeps={}) {
 export async function startFree(options={},providedDeps={}) {
   const deps=mergeDeps(providedDeps),root=path.resolve(options.repoRoot??repoRoot),paths=options.paths??launcherPaths(root);
   const officeDir=path.resolve(options.officeDir??paths.officeDir),routerPort=options.routerPort??4141,officePort=options.officePort??4748;
+  const backend=options.backend??process.env.STATEX_FREE_ROUTER_BACKEND??'typescript';
+  if(!['typescript','python','legacy'].includes(backend))throw new Error('Unknown free router backend; choose typescript or python');
+  const usePython=backend==='python'||backend==='legacy';
   if(options.signal?.aborted)throw new Error('Startup interrupted');
   fs.mkdirSync(paths.stateDir,{recursive:true});
   let state=readState(paths.stateFile,officeDir);
   for(const [kind,record] of Object.entries(state.processes)) if(record&&!sameProcess(record,root,deps)) delete state.processes[kind];
   // Inspect both ports before starting anything so foreign listeners cause a clean abort.
-  const routerListening=await deps.portListening(routerPort);
-  if(routerListening) {
+  const routerListening=usePython?await deps.portListening(routerPort):false;
+  if(usePython&&routerListening) {
     const health=await inspectRouterHealth(deps,`http://127.0.0.1:${routerPort}${HEALTH_PATH}`);
     if(!health.ok)throw new Error(`Port ${routerPort} is occupied, but the service cannot be reused: ${health.reason}. It was left running. Stop it only from its owning terminal or service manager; stop:free will not kill it.`);
     const identity=await deps.listenerIdentity(routerPort);
@@ -330,7 +333,7 @@ export async function startFree(options={},providedDeps={}) {
   const persist=()=>saveState(paths.stateFile,state);
   try {
     checkAbort();
-    if(!routerListening) {
+    if(usePython&&!routerListening) {
       const child=startGatewayProcess(root,routerPort,deps);
       handles.push({child,kind:'router'});checkAbort();
       await recordFor('router',child,root,routerPort,officeDir,deps,options.signal,record=>{state.processes.router=record;started.push(record);persist();});
@@ -340,7 +343,7 @@ export async function startFree(options={},providedDeps={}) {
       checkAbort();
       if(deps.needsBuild(root)) deps.build(root);
       checkAbort();
-      const child=startOfficeProcess(root,officeDir,officePort,deps);
+      const child=startOfficeProcess(root,officeDir,officePort,deps,backend);
       handles.push({child,kind:'office'});checkAbort();
       await recordFor('office',child,root,officePort,officeDir,deps,options.signal,record=>{state.processes.office=record;started.push(record);persist();});
       if(!await waitForReady('office',officePort,officeDir,deps,options.signal)) throw new Error('StateX HQ did not become ready in free-only mode; see its terminal output');
@@ -355,7 +358,7 @@ export async function startFree(options={},providedDeps={}) {
     throw error;
   }
   const owned=Object.values(state.processes).filter(r=>r&&sameProcess(r,root,deps));
-  deps.log(`StateX Free Router: ${routerListening?'reused':'started'} — http://127.0.0.1:${routerPort} (policy: free-only)`);
+  deps.log(usePython?`StateX Free Router (Python legacy): ${routerListening?'reused':'started'} — http://127.0.0.1:${routerPort} (policy: free-only)`:`StateX Free Router: in-process TypeScript (Groq → OpenRouter, free-only)`);
   deps.log(`StateX HQ: ${officeListening?'reused':'started'} — http://127.0.0.1:${officePort} (isolated: ${officeDir})`);
   deps.log(`Persistent office: ${officeDir}`);
   deps.log(`Launcher-controlled processes: ${owned.length?owned.map(x=>`${x.kind} pid=${x.pid}`).join(', '):'none; existing services will not be stopped'}`);

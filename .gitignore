@@ -3,5 +3,10 @@ dist/
 data/
 .DS_Store
 *.log
+.env
+.env.*
+!.env.example
+**/free-provider-attestations.json
+**/free-router-state.json
 .statex-free-dev/
 free-model-router/

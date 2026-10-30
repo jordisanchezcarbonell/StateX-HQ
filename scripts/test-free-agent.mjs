@@ -10,10 +10,13 @@ import {WebSocket} from 'ws';
 import { register } from 'node:module';
 register('./fixtures/no-agent-sdk-loader.mjs',import.meta.url);
 process.env.STATEX_FREE_ONLY='1';
+// This suite exercises the retained Python compatibility backend; the TypeScript
+// router is covered separately by fully mocked provider tests.
+process.env.STATEX_FREE_ROUTER_BACKEND='python';
 const scratch=fs.mkdtempSync(path.join(os.tmpdir(),'statex-free-agent-'));
 process.env.PIXEL_OFFICE_HOME=scratch;
 const {WorkspaceTools,FreeAgentError}=await import('../dist/server/free-agent-tools.js');
-const {runFreeAgent,FREE_LIMITS,gatewayBase}=await import('../dist/server/free-agent.js');
+const {runFreeAgent,createFreeAgentBudget,FREE_LIMITS,gatewayBase}=await import('../dist/server/free-agent.js');
 const {Employee,listConnectors}=await import('../dist/server/employee.js');
 const {Store}=await import('../dist/server/store.js');
 const {initRuntime}=await import('../dist/server/runtime.js');
@@ -137,16 +140,64 @@ try {
     assert.deepEqual(requests[0].messages.slice(1,-1),history);assert.equal(requests[0].max_tokens,1024);assert.equal(requests[0].model,'auto');
     assert(!('provider' in requests[0]));assert.deepEqual(requests[0].tools.map(t=>t.function.name),['Read','Write','Edit']);
   });
-  await test('configured request cap can tighten the run to four inferences',async()=>{
-    const previous=process.env.STATEX_FREE_MAX_REQUESTS;process.env.STATEX_FREE_MAX_REQUESTS='4';
+  await test('bounded Read → approved Edit → Read cycle completes within four inferences',async()=>{
+    fs.writeFileSync(readme,'# Before\n');const asks=[],used=[];
+    mockFetch([
+      response(tool('Read',{file_path:'README.md'},'cycle-read-1')),
+      response(tool('Edit',{file_path:'README.md',old_string:'# Before',new_string:'# After'},'cycle-edit')),
+      response(tool('Read',{file_path:'README.md'},'cycle-read-2')),
+      response({role:'assistant',content:'Verified # After.'}),
+    ]);
+    const history=await runFreeAgent(options({prompt:'Read, edit with approval, reread, confirm.',approve:async(name,args)=>{asks.push([name,args]);return true;},onTool:name=>used.push(name)}));
+    assert.equal(requests.length,4);assert.equal(asks.length,1);assert.equal(asks[0][0],'Edit');
+    assert.deepEqual(used,['Read','Edit','Read']);assert.equal(fs.readFileSync(readme,'utf8'),'# After\n');assert.equal(history.at(-1).content,'Verified # After.');
+  });
+  await test('Read → approved Write → Read completes inside the configured task iteration budget',async()=>{
+    fs.writeFileSync(readme,'# Existing\n');const asks=[],used=[];
+    mockFetch([
+      response(tool('Read',{file_path:'README.md'},'write-read-1')),
+      response(tool('Write',{file_path:'README.md',content:'# Replaced\n'},'write-approved')),
+      response(tool('Read',{file_path:'README.md'},'write-read-2')),
+      response({role:'assistant',content:'Verified # Replaced.'}),
+    ]);
+    await runFreeAgent(options({approve:async(name,args)=>{asks.push([name,args]);return true;},onTool:name=>used.push(name)}));
+    assert.equal(requests.length,4);assert.equal(asks.length,1);assert.equal(asks[0][0],'Write');
+    assert.deepEqual(used,['Read','Write','Read']);assert.equal(fs.readFileSync(readme,'utf8'),'# Replaced\n');
+  });
+  await test('identical successful mutation tool calls with new IDs are not executed or approved twice',async()=>{
+    fs.writeFileSync(readme,'# Before\n');const asks=[],used=[];
+    const editArgs={file_path:'README.md',old_string:'# Before',new_string:'# After'};
+    mockFetch([
+      response(tool('Read',{file_path:'README.md'},'dedupe-read')),
+      response({role:'assistant',content:null,tool_calls:[
+        {id:'edit-once',type:'function',function:{name:'Edit',arguments:JSON.stringify(editArgs)}},
+        {id:'edit-again',type:'function',function:{name:'Edit',arguments:JSON.stringify(editArgs)}},
+      ]}),
+      response(tool('Read',{file_path:'README.md'},'dedupe-reread')),
+      response({role:'assistant',content:'Verified.'}),
+    ]);
+    await runFreeAgent(options({approve:async()=>{asks.push('approved');return true;},onTool:name=>used.push(name)}));
+    assert.equal(asks.length,1);assert.deepEqual(used,['Read','Edit','Read']);assert.equal(requests.length,4);assert.equal(fs.readFileSync(readme,'utf8'),'# After\n');
+    const toolMessages=requests[2].messages.filter(m=>m.role==='tool');assert.deepEqual(toolMessages.map(m=>m.tool_call_id),['dedupe-read','edit-once','edit-again']);
+  });
+  await test('configured legacy request cap can tighten the run to two inferences',async()=>{
+    const previous=process.env.STATEX_FREE_MAX_REQUESTS;process.env.STATEX_FREE_MAX_REQUESTS='2';
     try {
       mockFetch(Array.from({length:5},(_,i)=>response(tool('Read',{file_path:'README.md'},`cap-${i}`))));
-      await assert.rejects(runFreeAgent(options()),/request_limit_before_tools/);assert.equal(requests.length,4);
+      await assert.rejects(runFreeAgent(options()),/request_limit_before_tools/);assert.equal(requests.length,2);
     } finally { if(previous===undefined)delete process.env.STATEX_FREE_MAX_REQUESTS;else process.env.STATEX_FREE_MAX_REQUESTS=previous; }
   });
+  await test('one task budget is shared across queued agent batches and cannot silently reset',async()=>{
+    const previous=process.env.STATEX_FREE_MAX_ITERATIONS;process.env.STATEX_FREE_MAX_ITERATIONS='2';
+    try {
+      const budget=createFreeAgentBudget();mockFetch([response(tool('Read',{file_path:'README.md'},'shared-1')),response()]);
+      await runFreeAgent(options({budget,taskId:19,agentId:'mia'}));assert.equal(budget.used,2);
+      mockFetch([]);await assert.rejects(runFreeAgent(options({budget,taskId:19,agentId:'mia',prompt:'second queued message'})),/request_limit/);assert.equal(requests.length,0);
+    } finally {if(previous===undefined)delete process.env.STATEX_FREE_MAX_ITERATIONS;else process.env.STATEX_FREE_MAX_ITERATIONS=previous;}
+  });
   await test('length is incomplete and executes no tools; malformed response/tool JSON fails closed',async()=>{
-    mockFetch(Array.from({length:6},(_,i)=>response(tool('Read',{file_path:'README.md'},`r${i}`))));
-    await assert.rejects(runFreeAgent(options()),/request_limit_before_tools/);assert.equal(requests.length,FREE_LIMITS.requests);
+    mockFetch(Array.from({length:FREE_LIMITS.defaultIterations},(_,i)=>response(tool('Read',{file_path:'README.md'},`r${i}`))));
+    await assert.rejects(runFreeAgent(options()),/request_limit_before_tools/);assert.equal(requests.length,FREE_LIMITS.defaultIterations);
     let used=[];mockFetch([response(tool('Write',{file_path:'length.md',content:'must not run'}),{choices:[{message:tool('Write',{file_path:'length.md',content:'must not run'}),finish_reason:'length'}],usage:{prompt_tokens:758,completion_tokens:512,cost:0}})]);
     await assert.rejects(runFreeAgent(options({onTool:n=>used.push(n)})),/incomplete_response/);assert.deepEqual(used,[]);assert(!fs.existsSync(path.join(ws,'length.md')));
     mockFetch([response({role:'assistant',content:'truncated'}, {model:'recursive/flint-v1.0:free',usage:{prompt_tokens:758,completion_tokens:512,cost:0,provider:'openrouter'},choices:[{message:{role:'assistant',content:'truncated',reasoning_details:[]},finish_reason:'length'}]})]);
@@ -237,7 +288,7 @@ try {
     const officePort=reservation.address().port;await new Promise(resolve=>reservation.close(resolve));
     const officeBase=`http://127.0.0.1:${officePort}`;
     let officeErrors='';
-    officeChild=spawn(process.execPath,['scripts/fixtures/free-office-server.mjs'],{stdio:['ignore','pipe','pipe'],env:{PATH:path.dirname(process.execPath),STATEX_FREE_ONLY:'1',STATEX_FREE_ROUTER_URL:base,PIXEL_OFFICE_MODE:'project',PIXEL_OFFICE_ROOT:officeWorkspace,PIXEL_OFFICE_HOME:path.join(scratch,'unused-home'),PORT:String(officePort)}});
+    officeChild=spawn(process.execPath,['scripts/fixtures/free-office-server.mjs'],{stdio:['ignore','pipe','pipe'],env:{PATH:path.dirname(process.execPath),STATEX_FREE_ONLY:'1',STATEX_FREE_ROUTER_BACKEND:'python',STATEX_FREE_ROUTER_URL:base,PIXEL_OFFICE_MODE:'project',PIXEL_OFFICE_ROOT:officeWorkspace,PIXEL_OFFICE_HOME:path.join(scratch,'unused-home'),PORT:String(officePort)}});
     officeChild.stdout.resume();officeChild.stderr.on('data',c=>officeErrors+=c);
     // Test-client reads may target only our two local fixtures.
     globalThis.fetch=(url,init)=>{assert([base,officeBase].some(b=>String(url).startsWith(b+'/')));return originalFetch(url,init);};
